@@ -5,7 +5,7 @@
 import { BrowserWindow } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
 import { ProviderAdapter } from "../core/providers/ir.ts";
-import { loadConfig, MagiConfig } from "../core/config.ts";
+import { loadConfig, MagiConfig, McpServerConfig } from "../core/config.ts";
 import { getMagiPaths, MagiPaths } from "../core/paths.ts";
 import { MessagesCompatibleAdapter } from "../core/providers/messages-compatible.ts";
 import { buildProviderRegistry } from "../core/providers/registry.ts";
@@ -17,8 +17,10 @@ export class Engine {
   private _running = false;
   private _sessionId: string | null = null;
   private _cwd: string = process.cwd();
+  private _mcpServers: Record<string, McpServerConfig> = {};
   private win: BrowserWindow;
   private store: SessionStore;
+  private _listeners: Array<(event: string, data: unknown) => void> = [];
 
   constructor(win: BrowserWindow, store: SessionStore) {
     this.win = win;
@@ -29,11 +31,19 @@ export class Engine {
   get sessionId(): string | null { return this._sessionId; }
   get cwd(): string { return this._cwd; }
   set cwd(dir: string) { this._cwd = dir; }
+  get mcpServers(): Record<string, McpServerConfig> { return this._mcpServers; }
+  set mcpServers(servers: Record<string, McpServerConfig>) { this._mcpServers = servers; }
+
+  /** Add a listener that receives all emitted events */
+  addListener(fn: (event: string, data: unknown) => void): void {
+    this._listeners.push(fn);
+  }
 
   private emit(event: string, data: unknown): void {
     if (!this.win.isDestroyed()) {
       this.win.webContents.send(event, data);
     }
+    for (const fn of this._listeners) fn(event, data);
   }
 
   async startQuery(sessionId: string, userMessage: string): Promise<void> {
@@ -120,6 +130,10 @@ export class Engine {
       let assistantText = "";
 
       // Run agent loop
+      const mcpConfig = Object.keys(this._mcpServers).length > 0
+        ? { servers: this._mcpServers }
+        : undefined;
+
       for await (const event of runAgentQuery({
         adapter,
         model,
@@ -131,6 +145,7 @@ export class Engine {
         sessionId,
         signal: this.abortController.signal,
         permissionMode: "auto",
+        mcp: mcpConfig,
         onStreamEvent: (ev) => {
           this.emit("engine:stream-event", ev);
           if (ev.type === "text_delta" && ev.text) {

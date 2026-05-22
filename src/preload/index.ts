@@ -23,6 +23,24 @@ const api = {
   setSettings: (settings: Record<string, string>) => ipcRenderer.invoke("settings:set", settings),
   testConnection: (settings: { baseUrl: string; apiKey: string; model: string }) => ipcRenderer.invoke("settings:test", settings),
 
+  // MCP Servers
+  listMcpServers: () => ipcRenderer.invoke("mcp:list"),
+  addMcpServer: (name: string, config: { command: string; args: string[] }) => ipcRenderer.invoke("mcp:add", name, config),
+  removeMcpServer: (name: string) => ipcRenderer.invoke("mcp:remove", name),
+
+  // Scheduled Tasks
+  listScheduledTasks: () => ipcRenderer.invoke("tasks:list-scheduled"),
+  pauseTask: (id: string) => ipcRenderer.invoke("tasks:pause", id),
+  resumeTask: (id: string) => ipcRenderer.invoke("tasks:resume", id),
+  deleteScheduledTask: (id: string) => ipcRenderer.invoke("tasks:delete", id),
+  getTaskHistory: (cronJobId?: string) => ipcRenderer.invoke("tasks:history", cronJobId),
+  getTaskResult: (taskId: string) => ipcRenderer.invoke("tasks:get-result", taskId),
+
+  // Remote Access
+  startRemote: () => ipcRenderer.invoke("remote:start"),
+  stopRemote: () => ipcRenderer.invoke("remote:stop"),
+  getRemoteStatus: () => ipcRenderer.invoke("remote:status"),
+
   // Config
   getConfig: () => ipcRenderer.invoke("config:get"),
 
@@ -44,6 +62,11 @@ const api = {
     const handler = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
     ipcRenderer.on("engine:error", handler);
     return () => ipcRenderer.removeListener("engine:error", handler);
+  },
+  onTaskEvent: (callback: (event: any) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
+    ipcRenderer.on("tasks:event", handler);
+    return () => ipcRenderer.removeListener("tasks:event", handler);
   },
 };
 

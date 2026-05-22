@@ -1,8 +1,8 @@
 {
-  "name": "magi-desktop",
+  "name": "kira",
   "version": "0.1.0",
   "private": true,
-  "description": "Magi Desktop — AI 运营搭子",
+  "description": "Kira — AI desktop assistant",
   "main": "dist/main/index.js",
   "scripts": {
     "dev:renderer": "vite",
@@ -20,6 +20,7 @@
   "dependencies": {
     "better-sqlite3": "^11.9.1",
     "playwright": "^1.52.0",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "ws": "^8.20.1",

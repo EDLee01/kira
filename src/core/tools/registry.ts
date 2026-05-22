@@ -947,7 +947,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "CronCreate",
-    description: "Create a 5-field local-time cron job that queues a prompt for future execution.",
+    description: "Create a scheduled task that runs automatically. Use this when the user asks for something to happen on a recurring schedule (e.g. '每天早上9点看知乎热榜', 'every morning check X', 'remind me weekly', 'monitor Z daily'). Convert the user's natural language schedule into a 5-field cron expression (minute hour day-of-month month day-of-week, local time). The prompt field should contain the full instruction for what the AI should do when the task fires.",
     category: "schedule",
     tags: ["cron", "schedule", "job"],
     inputSchema: CRON_CREATE_SCHEMA,

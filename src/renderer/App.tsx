@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import { cronToDisplay } from "./utils/cron-display";
 
 declare global {
   interface Window {
@@ -15,9 +16,16 @@ declare global {
       getSettings: () => Promise<{ baseUrl: string; apiKey: string; model: string }>;
       setSettings: (s: Record<string, string>) => Promise<Record<string, string>>;
       testConnection: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string }>;
+      listScheduledTasks: () => Promise<any[]>;
+      pauseTask: (id: string) => Promise<any>;
+      resumeTask: (id: string) => Promise<any>;
+      deleteScheduledTask: (id: string) => Promise<any>;
+      getTaskHistory: (cronJobId?: string) => Promise<any[]>;
+      getTaskResult: (taskId: string) => Promise<any>;
       onStreamEvent: (callback: (event: any) => void) => () => void;
       onEngineStatus: (callback: (status: any) => void) => () => void;
       onEngineError: (callback: (err: any) => void) => () => void;
+      onTaskEvent: (callback: (event: any) => void) => () => void;
     };
   }
 }
@@ -53,6 +61,8 @@ function contentToText(content: any): string {
   return "";
 }
 
+
+
 export default function App() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -61,6 +71,7 @@ export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [activeTab, setActiveTab] = useState<"chat" | "tasks">("chat");
   const [workspace, setWorkspace] = useState("");
   const [settings, setSettings] = useState({ baseUrl: "", apiKey: "", model: "", theme: "dark" });
   const streamText = useRef("");
@@ -106,7 +117,7 @@ export default function App() {
           }
         } catch {}
       } else {
-        const newId = await window.desktopAPI.createSession("Magi");
+        const newId = await window.desktopAPI.createSession("Kira");
         setSid(newId);
       }
     })();
@@ -259,7 +270,7 @@ export default function App() {
     streamText.current = "";
     let id = sid;
     if (!id) {
-      id = await window.desktopAPI.createSession("Magi");
+      id = await window.desktopAPI.createSession("Kira");
       setSid(id);
     }
     await window.desktopAPI.sendMessage(id, text);
@@ -278,7 +289,7 @@ export default function App() {
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
   }, []);
 
-  const currentTitle = sessions.find((s) => s.id === sid)?.title ?? "Magi";
+  const currentTitle = sessions.find((s) => s.id === sid)?.title ?? "Kira";
 
   return (
     <div className="app">
@@ -359,6 +370,8 @@ export default function App() {
         />
       )}
 
+      {activeTab === "chat" && (
+      <>
       {/* ── Messages ── */}
       <div className="messages-wrap">
         {msgs.length === 0 ? (
@@ -388,7 +401,7 @@ export default function App() {
                 </defs>
               </svg>
             </div>
-            <h2 className="empty-title">Magi Desktop</h2>
+            <h2 className="empty-title">Kira</h2>
             <p className="empty-sub">你的全能 AI 搭子，随时待命</p>
             <div className="suggestions">
               {["帮我打开知乎热榜", "搜索一下竞品信息", "帮我整理今天的工作"].map((s) => (
@@ -445,7 +458,7 @@ export default function App() {
           <textarea
             ref={inputRef}
             className="input-field"
-            placeholder="发消息给 Magi…"
+            placeholder="发消息给 Kira…"
             value={input}
             onChange={handleInput}
             onKeyDown={handleKey}
@@ -470,6 +483,27 @@ export default function App() {
         </div>
         <p className="input-hint">Enter 发送 · Shift+Enter 换行</p>
       </div>
+      </>
+      )}
+
+      {activeTab === "tasks" && <TasksView />}
+
+      {/* ── Tab Bar ── */}
+      <div className="tab-bar">
+        <button className={`tab-item ${activeTab === "chat" ? "active" : ""}`} onClick={() => setActiveTab("chat")}>
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <path d="M3 4a2 2 0 012-2h8a2 2 0 012 2v7a2 2 0 01-2 2H7l-3 3v-3a2 2 0 01-1-1.7V4z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <span>Chat</span>
+        </button>
+        <button className={`tab-item ${activeTab === "tasks" ? "active" : ""}`} onClick={() => setActiveTab("tasks")}>
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+            <circle cx="9" cy="9" r="7" stroke="currentColor" strokeWidth="1.3"/>
+            <path d="M9 5v4l3 2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <span>Tasks</span>
+        </button>
+      </div>
     </div>
   );
 }
@@ -484,6 +518,12 @@ function SettingsPanel({ settings, onSave, onClose }: {
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [remote, setRemote] = useState<{ running: boolean; publicUrl: string | null; accessUrl: string | null; token: string | null; clients: number; qrSvg: string | null }>({ running: false, publicUrl: null, accessUrl: null, token: null, clients: 0, qrSvg: null });
+  const [remoteLoading, setRemoteLoading] = useState(false);
+
+  useEffect(() => {
+    (window.desktopAPI as any).getRemoteStatus?.().then((s: any) => s && setRemote(s));
+  }, []);
 
   const testConn = async () => {
     setTesting(true);
@@ -491,6 +531,22 @@ function SettingsPanel({ settings, onSave, onClose }: {
     const result = await window.desktopAPI.testConnection(form);
     setTestResult(result);
     setTesting(false);
+  };
+
+  const toggleRemote = async () => {
+    setRemoteLoading(true);
+    if (remote.running) {
+      await (window.desktopAPI as any).stopRemote();
+      setRemote({ running: false, publicUrl: null, accessUrl: null, token: null, clients: 0, qrSvg: null });
+    } else {
+      const result = await (window.desktopAPI as any).startRemote();
+      if (result.error) {
+        setTestResult({ ok: false, message: result.error });
+      } else {
+        setRemote({ running: true, publicUrl: result.publicUrl, accessUrl: result.accessUrl, token: result.token, clients: 0, qrSvg: result.qrSvg });
+      }
+    }
+    setRemoteLoading(false);
   };
 
   return (
@@ -564,6 +620,29 @@ function SettingsPanel({ settings, onSave, onClose }: {
           </label>
         </div>
 
+        {/* MCP Servers */}
+        <McpSection />
+
+        {/* Remote Access */}
+        <div className="settings-section">
+          <div className="settings-section-header">
+            <span>Remote Access</span>
+            <button className={`remote-toggle ${remote.running ? "active" : ""}`} onClick={toggleRemote} disabled={remoteLoading}>
+              {remoteLoading ? "..." : remote.running ? "ON" : "OFF"}
+            </button>
+          </div>
+          {remote.running && remote.accessUrl && (
+            <div className="remote-info">
+              <div className="remote-qr" dangerouslySetInnerHTML={{ __html: remote.qrSvg || "" }} />
+              <p className="remote-url">{remote.accessUrl}</p>
+              <p className="remote-hint">{remote.publicUrl ? "公网可访问" : "仅局域网（手机需在同一 WiFi）"}</p>
+            </div>
+          )}
+          {remote.running && !remote.accessUrl && (
+            <p className="remote-hint">启动中...</p>
+          )}
+        </div>
+
         {testResult && (
           <div className={`test-result ${testResult.ok ? "test-ok" : "test-fail"}`}>
             {testResult.ok ? "✓ " : "✗ "}{testResult.message}
@@ -577,6 +656,166 @@ function SettingsPanel({ settings, onSave, onClose }: {
           <button className="settings-save" onClick={() => onSave(form)}>Save</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Tasks View */
+function TasksView() {
+  const [tasks, setTasks] = useState<any[]>([]);
+  const [history, setHistory] = useState<any[]>([]);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const t = await window.desktopAPI.listScheduledTasks();
+    setTasks(t);
+    const h = await window.desktopAPI.getTaskHistory();
+    setHistory(h);
+  }, []);
+
+  useEffect(() => {
+    load();
+    const unsub = window.desktopAPI.onTaskEvent(() => load());
+    return unsub;
+  }, [load]);
+
+  const toggle = async (task: any) => {
+    if (task.enabled) {
+      await window.desktopAPI.pauseTask(task.id);
+    } else {
+      await window.desktopAPI.resumeTask(task.id);
+    }
+    load();
+  };
+
+  const remove = async (id: string) => {
+    await window.desktopAPI.deleteScheduledTask(id);
+    load();
+  };
+
+  const taskHistory = (cronJobId: string) =>
+    history.filter((h: any) => h.metadata?.cronJobId === cronJobId);
+
+  return (
+    <div className="tasks-view">
+      {tasks.length === 0 ? (
+        <div className="tasks-empty">
+          <svg width="40" height="40" viewBox="0 0 18 18" fill="none">
+            <circle cx="9" cy="9" r="7" stroke="currentColor" strokeWidth="1"/>
+            <path d="M9 5v4l3 2" stroke="currentColor" strokeWidth="1" strokeLinecap="round"/>
+          </svg>
+          <p>还没有定时任务</p>
+          <p className="tasks-empty-hint">在对话中告诉 AI 你想定时做什么，它会自动创建</p>
+        </div>
+      ) : (
+        <div className="tasks-list">
+          {tasks.map((task) => (
+            <div key={task.id} className="task-card">
+              <div className="task-header" onClick={() => setExpandedId(expandedId === task.id ? null : task.id)}>
+                <div className="task-info">
+                  <span className={`task-status ${task.enabled ? "enabled" : "paused"}`} />
+                  <div className="task-meta">
+                    <span className="task-prompt">{task.prompt.slice(0, 50)}</span>
+                    <span className="task-schedule">{cronToDisplay(task.cron)}</span>
+                  </div>
+                </div>
+                <div className="task-actions">
+                  <button className="task-toggle" onClick={(e) => { e.stopPropagation(); toggle(task); }}>
+                    {task.enabled ? "Pause" : "Resume"}
+                  </button>
+                  <button className="task-del" onClick={(e) => { e.stopPropagation(); remove(task.id); }}>
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                      <line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+                      <line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              {expandedId === task.id && (
+                <div className="task-history">
+                  {taskHistory(task.id).length === 0 ? (
+                    <p className="task-history-empty">尚未执行过</p>
+                  ) : (
+                    taskHistory(task.id).slice(0, 5).map((h: any) => (
+                      <div key={h.id} className="task-run">
+                        <span className={`task-run-status ${h.status}`}>{h.status}</span>
+                        <span className="task-run-time">{new Date(h.updatedAt).toLocaleString("zh-CN")}</span>
+                        <p className="task-run-result">{(h.result ?? "").slice(0, 100)}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** MCP Servers Section */
+function McpSection() {
+  const [servers, setServers] = useState<Record<string, any>>({});
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newCmd, setNewCmd] = useState("");
+
+  useEffect(() => {
+    (window.desktopAPI as any).listMcpServers?.().then((s: any) => s && setServers(s));
+  }, []);
+
+  const add = async () => {
+    if (!newName.trim() || !newCmd.trim()) return;
+    const parts = newCmd.trim().split(/\s+/);
+    const command = parts[0];
+    const args = parts.slice(1);
+    const result = await (window.desktopAPI as any).addMcpServer(newName.trim(), { command, args });
+    setServers(result);
+    setNewName("");
+    setNewCmd("");
+    setAdding(false);
+  };
+
+  const remove = async (name: string) => {
+    const result = await (window.desktopAPI as any).removeMcpServer(name);
+    setServers(result);
+  };
+
+  const names = Object.keys(servers);
+
+  return (
+    <div className="settings-section">
+      <div className="settings-section-header">
+        <span>MCP Servers</span>
+        <button className="remote-toggle" onClick={() => setAdding(!adding)}>
+          {adding ? "Cancel" : "+ Add"}
+        </button>
+      </div>
+      {adding && (
+        <div className="mcp-add-form">
+          <input className="settings-input" placeholder="Server name (e.g. notion)" value={newName} onChange={(e) => setNewName(e.target.value)} />
+          <input className="settings-input" placeholder="Command (e.g. npx @notionhq/mcp-server)" value={newCmd} onChange={(e) => setNewCmd(e.target.value)} />
+          <button className="settings-save" style={{ width: "100%" }} onClick={add}>Add Server</button>
+        </div>
+      )}
+      {names.length === 0 && !adding && (
+        <p className="remote-hint">No MCP servers configured</p>
+      )}
+      {names.map((name) => (
+        <div key={name} className="mcp-server-item">
+          <div className="mcp-server-info">
+            <span className="mcp-server-name">{name}</span>
+            <span className="mcp-server-cmd">{servers[name].command} {(servers[name].args || []).join(" ")}</span>
+          </div>
+          <button className="task-del" onClick={() => remove(name)}>
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+              <line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          </button>
+        </div>
+      ))}
     </div>
   );
 }

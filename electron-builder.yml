@@ -1,5 +1,5 @@
-appId: com.magi.desktop
-productName: Magi Desktop
+appId: com.kira.app
+productName: Kira
 directories:
   output: release
   buildResources: build
@@ -10,11 +10,11 @@ files:
   - node_modules/**/*
 mac:
   target: dmg
-  artifactName: Magi-Desktop-${version}-mac.${ext}
+  artifactName: Kira-${version}-mac.${ext}
   category: public.app-category.productivity
 win:
   target: nsis
-  artifactName: Magi-Desktop-Setup-${version}.${ext}
+  artifactName: Kira-Setup-${version}.${ext}
 linux:
   target: AppImage
-  artifactName: Magi-Desktop-${version}.${ext}
+  artifactName: Kira-${version}.${ext}

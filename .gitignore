@@ -4,3 +4,9 @@ release/
 .DS_Store
 *.log
 .magi-browser-profile/
+
+# Local state and secrets
+.env
+.env.local
+*.sqlite
+*.sqlite-journal

@@ -9,7 +9,7 @@ import { runAgentQuery } from "../src/core/agent/query.ts";
 import { getMagiPaths } from "../src/core/paths.ts";
 
 async function main() {
-  console.log("=== magi-desktop backend smoke test ===\n");
+  console.log("=== kira backend smoke test ===\n");
 
   // 1. Build provider from env
   const apiKey = process.env["ANTHROPIC_AUTH_TOKEN"];
