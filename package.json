@@ -6,10 +6,10 @@
   "main": "dist/main/index.js",
   "scripts": {
     "dev:renderer": "vite",
-    "dev:main": "esbuild src/main/index.ts --bundle --platform=node --outfile=dist/main/index.js --external:electron --external:playwright --external:better-sqlite3 --tsconfig=tsconfig.json && esbuild src/preload/index.ts --bundle --platform=node --outfile=dist/preload/index.js --external:electron --tsconfig=tsconfig.json",
+    "dev:main": "esbuild src/main/index.ts --bundle --platform=node --outfile=dist/main/index.js --external:electron --external:playwright --external:better-sqlite3 --external:iconv-lite --tsconfig=tsconfig.json && esbuild src/preload/index.ts --bundle --platform=node --outfile=dist/preload/index.js --external:electron --tsconfig=tsconfig.json",
     "dev": "npm run dev:main && concurrently -k \"npm run dev:renderer\" \"sleep 2 && NODE_ENV=development electron .\"",
     "build:renderer": "vite build",
-    "build:main": "esbuild src/main/index.ts --bundle --platform=node --outfile=dist/main/index.js --external:electron --external:playwright --external:better-sqlite3 --tsconfig=tsconfig.json && esbuild src/preload/index.ts --bundle --platform=node --outfile=dist/preload/index.js --external:electron --tsconfig=tsconfig.json",
+    "build:main": "esbuild src/main/index.ts --bundle --platform=node --outfile=dist/main/index.js --external:electron --external:playwright --external:better-sqlite3 --external:iconv-lite --tsconfig=tsconfig.json && esbuild src/preload/index.ts --bundle --platform=node --outfile=dist/preload/index.js --external:electron --tsconfig=tsconfig.json",
     "build:core": "esbuild src/core/agent/query.ts --bundle --platform=node --outfile=dist/core/agent/query.js --external:electron --external:playwright --external:better-sqlite3 --tsconfig=tsconfig.json",
     "build": "npm run build:main && npm run build:renderer",
     "dist": "npm run build && electron-builder",
@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.9.1",
+    "iconv-lite": "^0.7.2",
     "playwright": "^1.52.0",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",

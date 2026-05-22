@@ -10,3 +10,4 @@ release/
 .env.local
 *.sqlite
 *.sqlite-journal
+uploads/

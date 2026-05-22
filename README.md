@@ -65,4 +65,6 @@ npm run dist:win    # Windows NSIS installer
 
 ## License
 
-MIT
+[Business Source License 1.1](./LICENSE) — 个人和非商业用途免费。商业 SaaS 服务需联系作者获取商业授权。2029-05-22 后自动转为 MIT。
+
+商业授权咨询：edwardlee5423@gmail.com

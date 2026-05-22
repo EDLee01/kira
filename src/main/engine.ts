@@ -217,6 +217,31 @@ export class Engine {
         defaultModel: model,
       },
       env: process.env,
+      fetchImpl: retryingFetch,
     });
   }
+}
+
+/**
+ * Wrap fetch with retry on transient network errors.
+ * Retries up to 3 times with exponential backoff for "fetch failed" / connection errors.
+ */
+async function retryingFetch(input: any, init?: any): Promise<Response> {
+  const maxAttempts = 3;
+  let lastError: any;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fetch(input, init);
+    } catch (err: any) {
+      lastError = err;
+      // Don't retry on abort
+      if (err?.name === "AbortError" || init?.signal?.aborted) throw err;
+      const msg = String(err?.message || "");
+      const isNetworkError = msg.includes("fetch failed") || msg.includes("ENOTFOUND") || msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED");
+      if (!isNetworkError || attempt === maxAttempts - 1) throw err;
+      // Exponential backoff: 1s, 2s, 4s
+      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+    }
+  }
+  throw lastError;
 }
