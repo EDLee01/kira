@@ -5,6 +5,8 @@ import { startScheduler } from "./scheduler";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
 import { MessagesCompatibleAdapter } from "../core/providers/messages-compatible.ts";
+import { readDesktopSettings } from "./settings-store";
+import { normalizeAnthropicBaseUrl, resolveModelForDesktop } from "./model-discovery";
 
 let mainWindow: BrowserWindow | null = null;
 let stopScheduler: (() => void) | null = null;
@@ -35,16 +37,23 @@ function createWindow(): void {
     paths,
     win: mainWindow,
     getAdapter: () => {
-      const baseUrl = process.env["ANTHROPIC_BASE_URL"] ?? "https://api.anthropic.com";
+      const settings = readDesktopSettings(paths);
+      const apiKey = settings.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"];
+      const baseUrl = normalizeAnthropicBaseUrl(settings.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com");
+      const model = resolveModelForDesktop(settings);
       return new MessagesCompatibleAdapter({
         name: "anthropic",
-        config: { type: "messages-compatible", format: "anthropic-messages", baseUrl, apiKeyEnv: "ANTHROPIC_AUTH_TOKEN", defaultModel: "claude-haiku-4-5" },
-        env: process.env,
+        config: { type: "messages-compatible", format: "anthropic-messages", baseUrl, apiKeyEnv: "ANTHROPIC_AUTH_TOKEN", defaultModel: model },
+        env: {
+          ...process.env,
+          ANTHROPIC_AUTH_TOKEN: apiKey || "",
+          ANTHROPIC_BASE_URL: baseUrl,
+          ANTHROPIC_MODEL: model,
+        },
       });
     },
     getModel: () => {
-      const raw = process.env["ANTHROPIC_MODEL"] ?? "claude-haiku-4-5";
-      return raw === "auto" ? (process.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] ?? "claude-sonnet-4-6") : raw;
+      return resolveModelForDesktop(readDesktopSettings(paths));
     },
   });
 

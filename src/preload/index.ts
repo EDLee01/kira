@@ -23,6 +23,7 @@ const api = {
   getSettings: () => ipcRenderer.invoke("settings:get"),
   setSettings: (settings: Record<string, string>) => ipcRenderer.invoke("settings:set", settings),
   testConnection: (settings: { baseUrl: string; apiKey: string; model: string }) => ipcRenderer.invoke("settings:test", settings),
+  discoverModels: (settings: { baseUrl: string; apiKey: string; model: string }) => ipcRenderer.invoke("settings:discover-models", settings),
 
   // MCP Servers
   listMcpServers: () => ipcRenderer.invoke("mcp:list"),

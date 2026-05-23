@@ -12,6 +12,8 @@ import { buildProviderRegistry } from "../core/providers/registry.ts";
 import { SessionStore } from "../core/session-store.ts";
 import { compactSession, recoverSessionContext } from "../core/context/compaction.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
+import { readDesktopSettings } from "./settings-store";
+import { normalizeAnthropicBaseUrl, resolveModelForDesktop } from "./model-discovery";
 
 export class Engine {
   private abortController: AbortController | null = null;
@@ -123,11 +125,7 @@ export class Engine {
         messages.push({ role: m.role, content });
       }
 
-      // Determine model — resolve "auto" to a real model name
-      const rawModel = process.env["ANTHROPIC_MODEL"] ?? "claude-haiku-4-5";
-      const model = rawModel === "auto"
-        ? (process.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] ?? "claude-sonnet-4-6")
-        : rawModel;
+      const model = resolveModelForDesktop(readDesktopSettings(paths));
 
       this.emit("engine:status", { running: true, sessionId });
 
@@ -231,13 +229,21 @@ export class Engine {
       if (first) return first;
     }
 
-    const apiKey = process.env["ANTHROPIC_AUTH_TOKEN"];
-    const baseUrl = process.env["ANTHROPIC_BASE_URL"] ?? "https://api.anthropic.com";
-    const model = process.env["ANTHROPIC_MODEL"] ?? "claude-haiku-4-5";
+    const settings = readDesktopSettings(paths);
+    const apiKey = settings.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"];
+    const baseUrl = normalizeAnthropicBaseUrl(settings.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com");
+    const model = resolveModelForDesktop(settings);
 
     if (!apiKey) {
       throw new Error("No API key. Set ANTHROPIC_AUTH_TOKEN in your environment.");
     }
+
+    const env = {
+      ...process.env,
+      ANTHROPIC_AUTH_TOKEN: apiKey,
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_MODEL: model,
+    };
 
     return new MessagesCompatibleAdapter({
       name: "anthropic",
@@ -248,7 +254,7 @@ export class Engine {
         apiKeyEnv: "ANTHROPIC_AUTH_TOKEN",
         defaultModel: model,
       },
-      env: process.env,
+      env,
       fetchImpl: retryingFetch,
     });
   }

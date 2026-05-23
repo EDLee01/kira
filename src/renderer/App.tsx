@@ -1,6 +1,35 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { cronToDisplay } from "./utils/cron-display";
 
+interface DiscoveredModel {
+  id: string;
+  label: string;
+  source: "discovered" | "fallback";
+  capabilities: {
+    role: "fast" | "main" | "deep";
+    vision: boolean;
+    longContext: boolean;
+  };
+}
+
+interface AutoModelRoutes {
+  fast: string;
+  main: string;
+  deep: string;
+  vision: string;
+  long: string;
+}
+
+interface SettingsState {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  theme: string;
+  availableModels?: DiscoveredModel[];
+  autoRoutes?: AutoModelRoutes;
+  modelsUpdatedAt?: string;
+}
+
 declare global {
   interface Window {
     desktopAPI: {
@@ -14,9 +43,10 @@ declare global {
       getSession: (id: string) => Promise<any>;
       getWorkspace: () => Promise<string>;
       pickWorkspace: () => Promise<string | null>;
-      getSettings: () => Promise<{ baseUrl: string; apiKey: string; model: string }>;
-      setSettings: (s: Record<string, string>) => Promise<Record<string, string>>;
-      testConnection: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string }>;
+      getSettings: () => Promise<SettingsState>;
+      setSettings: (s: SettingsState) => Promise<SettingsState>;
+      testConnection: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string; discovery?: { models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string } }>;
+      discoverModels: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string; models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string }>;
       listScheduledTasks: () => Promise<any[]>;
       pauseTask: (id: string) => Promise<any>;
       resumeTask: (id: string) => Promise<any>;
@@ -80,7 +110,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "tasks">("chat");
   const [workspace, setWorkspace] = useState("");
-  const [settings, setSettings] = useState({ baseUrl: "", apiKey: "", model: "", theme: "dark" });
+  const [settings, setSettings] = useState<SettingsState>({ baseUrl: "", apiKey: "", model: "", theme: "dark" });
   const streamText = useRef("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -260,7 +290,7 @@ export default function App() {
   }, []);
 
   // Save settings
-  const saveSettings = useCallback(async (newSettings: typeof settings) => {
+  const saveSettings = useCallback(async (newSettings: SettingsState) => {
     await window.desktopAPI.setSettings(newSettings);
     setSettings(newSettings);
     document.documentElement.setAttribute("data-theme", newSettings.theme || "dark");
@@ -533,16 +563,20 @@ export default function App() {
 
 /** Settings Panel */
 function SettingsPanel({ settings, onSave, onClose }: {
-  settings: { baseUrl: string; apiKey: string; model: string; theme: string };
-  onSave: (s: typeof settings) => void;
+  settings: SettingsState;
+  onSave: (s: SettingsState) => void;
   onClose: () => void;
 }) {
   const [form, setForm] = useState(settings);
   const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [remote, setRemote] = useState<{ running: boolean; publicUrl: string | null; accessUrl: string | null; token: string | null; clients: number; qrSvg: string | null }>({ running: false, publicUrl: null, accessUrl: null, token: null, clients: 0, qrSvg: null });
   const [remoteLoading, setRemoteLoading] = useState(false);
+  const availableModels = form.availableModels ?? [];
+  const selectedModelExists = form.model === "auto" || availableModels.some((model) => model.id === form.model);
+  const showCustomModelInput = Boolean(form.model && !selectedModelExists);
 
   useEffect(() => {
     (window.desktopAPI as any).getRemoteStatus?.().then((s: any) => s && setRemote(s));
@@ -552,8 +586,30 @@ function SettingsPanel({ settings, onSave, onClose }: {
     setTesting(true);
     setTestResult(null);
     const result = await window.desktopAPI.testConnection(form);
+    if (result.discovery) {
+      setForm((current) => ({
+        ...current,
+        availableModels: result.discovery!.models,
+        autoRoutes: result.discovery!.auto,
+        modelsUpdatedAt: result.discovery!.updatedAt,
+      }));
+    }
     setTestResult(result);
     setTesting(false);
+  };
+
+  const refreshModels = async () => {
+    setRefreshingModels(true);
+    setTestResult(null);
+    const result = await window.desktopAPI.discoverModels(form);
+    setForm((current) => ({
+      ...current,
+      availableModels: result.models,
+      autoRoutes: result.auto,
+      modelsUpdatedAt: result.updatedAt,
+    }));
+    setTestResult({ ok: result.ok, message: result.message });
+    setRefreshingModels(false);
   };
 
   const toggleRemote = async () => {
@@ -630,16 +686,41 @@ function SettingsPanel({ settings, onSave, onClose }: {
             <span>Model</span>
             <select
               className="settings-input settings-select"
-              value={form.model}
-              onChange={(e) => setForm({ ...form, model: e.target.value })}
+              value={showCustomModelInput ? "__custom__" : form.model}
+              onChange={(e) => setForm({ ...form, model: e.target.value === "__custom__" ? "" : e.target.value })}
             >
-              <option value="claude-haiku-4-5">Claude Haiku 4.5 (Fast)</option>
-              <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-              <option value="claude-opus-4-7">Claude Opus 4.7</option>
-              <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-              <option value="auto">Auto (Proxy decides)</option>
+              <option value="auto">Auto (dynamic)</option>
+              {availableModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label} {model.source === "fallback" ? "(default)" : ""}
+                </option>
+              ))}
+              <option value="__custom__">Custom model...</option>
             </select>
+            <div className="model-actions">
+              <button className="settings-mini-btn" onClick={refreshModels} disabled={refreshingModels || !form.apiKey}>
+                {refreshingModels ? "Refreshing..." : "Refresh Models"}
+              </button>
+              {form.modelsUpdatedAt && (
+                <span className="model-updated">Updated {new Date(form.modelsUpdatedAt).toLocaleString()}</span>
+              )}
+            </div>
+            {(showCustomModelInput || form.model === "") && (
+              <input
+                className="settings-input"
+                value={form.model}
+                onChange={(e) => setForm({ ...form, model: e.target.value })}
+                placeholder="Enter custom model id"
+              />
+            )}
+            {form.model === "auto" && form.autoRoutes && (
+              <div className="auto-routes">
+                <div><span>Fast</span><b>{form.autoRoutes.fast}</b></div>
+                <div><span>Main</span><b>{form.autoRoutes.main}</b></div>
+                <div><span>Deep</span><b>{form.autoRoutes.deep}</b></div>
+                <div><span>Vision</span><b>{form.autoRoutes.vision}</b></div>
+              </div>
+            )}
           </label>
         </div>
 

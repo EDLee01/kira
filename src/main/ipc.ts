@@ -7,6 +7,13 @@ import { executeGoalCommand } from "../core/goal.ts";
 import { listCronJobs, applyCronUpdate, deleteCronJob, cronStorePathFromRoot } from "../core/tools/cron.ts";
 import { startRemoteServer, stopRemoteServer, isRunning as isRemoteRunning, getToken, getConnectedClients, broadcast } from "./remote-server";
 import { startTunnel, stopTunnel, getTunnelUrl, isTunnelRunning } from "./tunnel";
+import { applyDesktopSettingsToEnv, readDesktopSettings, writeDesktopSettings } from "./settings-store";
+import {
+  discoverModels,
+  modelDiscoveryFromSettings,
+  serializeModelDiscovery,
+  testModelConnection,
+} from "./model-discovery";
 import QRCode from "qrcode";
 import * as os from "os";
 import * as fs from "fs";
@@ -17,21 +24,16 @@ export function registerIPC(win: BrowserWindow): void {
   const store = SessionStore.open(paths);
   const engine = new Engine(win, store);
 
-  // ── Settings helpers (used by multiple sections) ──
-  const settingsFile = path.join(paths.stateRoot, "desktop-settings.json");
-
-  function readSettings(): Record<string, string> {
-    try {
-      return JSON.parse(fs.readFileSync(settingsFile, "utf-8"));
-    } catch {
-      return {};
+  const readSettings = () => readDesktopSettings(paths);
+  const writeSettings = (settings: Record<string, string>) => writeDesktopSettings(paths, settings);
+  const normalizeIncomingSettings = (settings: Record<string, unknown>): Record<string, string> => {
+    const normalized: Record<string, string> = {};
+    for (const key of ["baseUrl", "apiKey", "model", "theme", "workspace"]) {
+      const value = settings[key];
+      if (typeof value === "string") normalized[key] = value;
     }
-  }
-
-  function writeSettings(settings: Record<string, string>): void {
-    fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
-    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2));
-  }
+    return normalized;
+  };
 
   // ── Sessions ──
 
@@ -194,48 +196,50 @@ export function registerIPC(win: BrowserWindow): void {
 
   ipcMain.handle("settings:get", () => {
     const saved = readSettings();
+    const modelDiscovery = modelDiscoveryFromSettings(saved);
     return {
       baseUrl: saved.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com",
       apiKey: saved.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"] || "",
       model: saved.model || process.env["ANTHROPIC_MODEL"] || "claude-haiku-4-5",
+      theme: saved.theme || "dark",
+      availableModels: modelDiscovery.models,
+      autoRoutes: modelDiscovery.auto,
+      modelsUpdatedAt: modelDiscovery.updatedAt,
     };
   });
 
-  ipcMain.handle("settings:set", (_event, settings: Record<string, string>) => {
+  ipcMain.handle("settings:set", (_event, settings: Record<string, unknown>) => {
     const current = readSettings();
-    const merged = { ...current, ...settings };
+    const merged = { ...current, ...normalizeIncomingSettings(settings) };
     writeSettings(merged);
-    // Apply to process.env so engine picks them up immediately
-    if (merged.apiKey) process.env["ANTHROPIC_AUTH_TOKEN"] = merged.apiKey;
-    if (merged.baseUrl) process.env["ANTHROPIC_BASE_URL"] = merged.baseUrl;
-    if (merged.model) process.env["ANTHROPIC_MODEL"] = merged.model;
+    applyDesktopSettingsToEnv(merged);
     return merged;
   });
 
-  ipcMain.handle("settings:test", async (_event, settings: { baseUrl: string; apiKey: string; model: string }) => {
-    try {
-      const model = settings.model === "auto" ? "claude-haiku-4-5" : settings.model;
-      const res = await fetch(`${settings.baseUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": settings.apiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 10,
-          messages: [{ role: "user", content: "hi" }],
-        }),
-      });
-      if (res.ok) {
-        return { ok: true, message: "Connected" };
-      }
-      const body = await res.text();
-      return { ok: false, message: `${res.status}: ${body.slice(0, 100)}` };
-    } catch (err) {
-      return { ok: false, message: (err as Error).message };
-    }
+  ipcMain.handle("settings:test", async (_event, settings: Record<string, unknown>) => {
+    const normalized = normalizeIncomingSettings(settings);
+    const current = readSettings();
+    const result = await testModelConnection({ ...current, ...normalized });
+    const discoveryCache = result.discovery.ok
+      ? serializeModelDiscovery(result.discovery)
+      : {};
+    const merged = { ...current, ...normalized, ...discoveryCache };
+    writeSettings(merged);
+    applyDesktopSettingsToEnv(merged);
+    return result;
+  });
+
+  ipcMain.handle("settings:discover-models", async (_event, settings: Record<string, unknown>) => {
+    const normalized = normalizeIncomingSettings(settings);
+    const current = readSettings();
+    const result = await discoverModels({ ...current, ...normalized });
+    const discoveryCache = result.ok
+      ? serializeModelDiscovery(result)
+      : {};
+    const merged = { ...current, ...normalized, ...discoveryCache };
+    writeSettings(merged);
+    applyDesktopSettingsToEnv(merged);
+    return result;
   });
 
   // ── MCP Servers ──
