@@ -1,6 +1,6 @@
 {
   "name": "kira",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Kira — AI desktop assistant",
   "main": "dist/main/index.js",
