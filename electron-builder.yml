@@ -8,13 +8,21 @@ files:
   - dist/**/*
   - package.json
   - node_modules/**/*
+extraResources:
+  - from: build/icon.png
+    to: build/icon.png
+  - from: build/icon.ico
+    to: build/icon.ico
 mac:
   target: dmg
   artifactName: Kira-${version}-mac.${ext}
   category: public.app-category.productivity
+  icon: build/icon.icns
 win:
   target: nsis
   artifactName: Kira-Setup-${version}.${ext}
+  icon: build/icon.ico
 linux:
   target: AppImage
   artifactName: Kira-${version}.${ext}
+  icon: build/icon.png

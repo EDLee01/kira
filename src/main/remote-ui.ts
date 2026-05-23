@@ -29,11 +29,29 @@ body { font-family: -apple-system, system-ui, sans-serif; background: var(--bg);
 .view { flex: 1; overflow-y: auto; display: none; flex-direction: column; }
 .view.active { display: flex; }
 .messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
-.msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; animation: fadeIn 0.2s; }
+.msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; word-break: break-word; animation: fadeIn 0.2s; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
 .msg-user { background: var(--accent); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
 .msg-ai { background: var(--surface); border: 1px solid var(--border); align-self: flex-start; border-bottom-left-radius: 4px; }
 .msg-error { background: rgba(239,83,80,0.1); color: var(--error); align-self: center; font-size: 12px; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 6px 0; }
+.md h1, .md h2, .md h3 { margin: 12px 0 6px; line-height: 1.25; }
+.md h1 { font-size: 19px; }
+.md h2 { font-size: 17px; }
+.md h3 { font-size: 15px; }
+.md ul, .md ol { margin: 6px 0; padding-left: 1.25rem; }
+.md li { margin: 3px 0; }
+.md blockquote { margin: 8px 0; padding-left: 10px; border-left: 3px solid var(--border); color: var(--fg2); }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: rgba(255,255,255,0.08); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+.md pre { margin: 8px 0; padding: 10px 12px; overflow-x: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+.md pre code { display: block; padding: 0; border: 0; background: none; white-space: pre; word-break: normal; }
+.md a { color: #78ddff; text-decoration: underline; text-underline-offset: 3px; }
+.md-table-wrap { overflow-x: auto; margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; }
+.md table { min-width: 100%; border-collapse: collapse; font-size: 12px; }
+.md th, .md td { padding: 6px 8px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+.md th { background: rgba(255,255,255,0.05); }
 .input-area { padding: 8px 12px; border-top: 1px solid var(--border); background: var(--surface); display: flex; gap: 8px; align-items: center; }
 .input-area input[type="text"], .input-area input.text { flex: 1; padding: 10px 14px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); font-size: 15px; outline: none; }
 .input-area input.text:focus { border-color: var(--accent); }
@@ -166,7 +184,7 @@ function addMsg(cls, text) {
   const msgs = document.getElementById("msgs");
   const div = document.createElement("div");
   div.className = "msg " + cls;
-  div.textContent = text;
+  div.innerHTML = renderMarkdown(text);
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
 }
@@ -174,7 +192,7 @@ function addMsg(cls, text) {
 function updateLastAI(text) {
   const msgs = document.getElementById("msgs");
   const last = msgs.lastElementChild;
-  if (last && last.classList.contains("msg-ai")) { last.textContent = text; msgs.scrollTop = msgs.scrollHeight; }
+  if (last && last.classList.contains("msg-ai")) { last.innerHTML = renderMarkdown(text); msgs.scrollTop = msgs.scrollHeight; }
 }
 
 function switchTab(tab) {
@@ -203,7 +221,58 @@ function newChat() {
   streaming = "";
 }
 
-function esc(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+
+function renderMarkdown(source) {
+  const blocks = [];
+  let html = esc(source || "").replace(new RegExp("\\\\r\\\\n?", "g"), "\\n");
+  const fencePattern = new RegExp("\\\\x60\\\\x60\\\\x60([a-zA-Z0-9_-]+)?\\\\n([\\\\s\\\\S]*?)\\\\x60\\\\x60\\\\x60", "g");
+  html = html.replace(fencePattern, (_, lang, code) => {
+    const token = "__CODE_BLOCK_" + blocks.length + "__";
+    blocks.push('<pre><code' + (lang ? ' data-lang="' + esc(lang) + '"' : '') + '>' + code + '</code></pre>');
+    return token;
+  });
+  html = renderTables(html);
+  html = html
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    .replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/^[-*] \\[x\\] (.+)$/gim, '<ul><li><input type="checkbox" checked disabled> $1</li></ul>')
+    .replace(/^[-*] \\[ \\] (.+)$/gim, '<ul><li><input type="checkbox" disabled> $1</li></ul>')
+    .replace(/^[-*] (.+)$/gm, "<ul><li>$1</li></ul>")
+    .replace(/^\\d+\\. (.+)$/gm, "<ol><li>$1</li></ol>")
+    .replace(new RegExp("\\\\x60([^\\\\x60]+)\\\\x60", "g"), "<code>$1</code>")
+    .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
+    .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+|mailto:[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  html = html
+    .replace(/<\\/ul>\\n<ul>/g, "\\n")
+    .replace(/<\\/ol>\\n<ol>/g, "\\n")
+    .split(/\\n{2,}/)
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return "";
+      if (/^__CODE_BLOCK_\\d+__$/.test(trimmed)) return trimmed;
+      if (/^<(h\\d|ul|ol|blockquote|pre|div|table)/.test(trimmed)) return trimmed;
+      return "<p>" + trimmed.replace(/\\n/g, "<br>") + "</p>";
+    })
+    .join("");
+  html = html.replace(/__CODE_BLOCK_(\\d+)__/g, (_, index) => blocks[Number(index)] || "");
+  return '<div class="md">' + html + '</div>';
+}
+
+function renderTables(input) {
+  const tablePattern = new RegExp("(?:^|\\\\n)((?:\\\\|.*\\\\|\\\\n)+\\\\|?\\\\s*:?-{3,}:?\\\\s*(?:\\\\|\\\\s*:?-{3,}:?\\\\s*)+\\\\|?\\\\n(?:\\\\|.*\\\\|(?:\\\\n|$))+)","g");
+  return input.replace(tablePattern, (match, tableText) => {
+    const rows = tableText.trim().split("\\n").map((line) => line.trim().replace(/^\\||\\|$/g, "").split("|").map((cell) => cell.trim()));
+    if (rows.length < 3) return match;
+    const head = rows[0];
+    const body = rows.slice(2);
+    const thead = "<thead><tr>" + head.map((cell) => "<th>" + cell + "</th>").join("") + "</tr></thead>";
+    const tbody = "<tbody>" + body.map((row) => "<tr>" + row.map((cell) => "<td>" + cell + "</td>").join("") + "</tr>").join("") + "</tbody>";
+    return '\\n<div class="md-table-wrap"><table>' + thead + tbody + '</table></div>\\n';
+  });
+}
 
 document.getElementById("inp").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 connect();

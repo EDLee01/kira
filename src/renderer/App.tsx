@@ -1,4 +1,8 @@
 import { useState, useCallback, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import kiraLogo from "./assets/kira-logo.svg";
+import { MARKDOWN_SAMPLE } from "./markdown-sample";
 import { cronToDisplay } from "./utils/cron-display";
 
 interface DiscoveredModel {
@@ -59,6 +63,7 @@ declare global {
       onEngineStatus: (callback: (status: any) => void) => () => void;
       onEngineError: (callback: (err: any) => void) => () => void;
       onTaskEvent: (callback: (event: any) => void) => () => void;
+      openExternal: (url: string) => Promise<void>;
     };
   }
 }
@@ -87,6 +92,13 @@ function displaySessionTitle(title: string | null | undefined, fallback = "Untit
   return title.trim() === "Magi" ? DEFAULT_SESSION_TITLE : title;
 }
 
+function displayWorkspacePath(workspace: string): string {
+  const trimmed = workspace.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "Workspace";
+  const parts = trimmed.split(/[\\/]+/);
+  return parts[parts.length - 1] || trimmed;
+}
+
 /** Extract display text from a parsed message content field */
 function contentToText(content: any): string {
   if (typeof content === "string") return content;
@@ -100,7 +112,64 @@ function contentToText(content: any): string {
   return "";
 }
 
+function isSafeExternalUrl(url: string | undefined): url is string {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "mailto:";
+  } catch {
+    return false;
+  }
+}
 
+function MessageMarkdown({ text, isError }: { text: string; isError?: boolean }) {
+  const openExternal = useCallback((href: string | undefined) => {
+    if (!isSafeExternalUrl(href)) return;
+    void window.desktopAPI?.openExternal?.(href);
+  }, []);
+
+  return (
+    <div className={`msg-text markdown-body ${isError ? "msg-error" : ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) => (
+            <a
+              href={isSafeExternalUrl(href) ? href : undefined}
+              className="markdown-link"
+              title={href}
+              onClick={(event) => {
+                event.preventDefault();
+                openExternal(href);
+              }}
+            >
+              {children}
+            </a>
+          ),
+          pre: ({ children }) => <pre>{children}</pre>,
+          code: ({ children, className }) => {
+            const language = /language-([\w-]+)/.exec(className ?? "")?.[1];
+            return (
+              <code className={className} data-language={language}>
+                {children}
+              </code>
+            );
+          },
+          table: ({ children }) => (
+            <div className="markdown-table-wrap">
+              <table>{children}</table>
+            </div>
+          ),
+          input: ({ checked, type }) => (
+            <input type={type} checked={Boolean(checked)} readOnly />
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 export default function App() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -117,6 +186,7 @@ export default function App() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const historyRef = useRef<HTMLDivElement>(null);
+  const markdownSampleMode = new URLSearchParams(window.location.search).has("markdown-sample");
 
   // Load sessions
   const loadSessions = useCallback(async () => {
@@ -128,6 +198,8 @@ export default function App() {
 
   // Init: load latest session or create one
   useEffect(() => {
+    if (markdownSampleMode) return;
+
     (async () => {
       // Load workspace
       const cwd = await window.desktopAPI.getWorkspace();
@@ -160,7 +232,7 @@ export default function App() {
         setSid(newId);
       }
     })();
-  }, []);
+  }, [markdownSampleMode]);
 
   // Click outside to close history dropdown
   useEffect(() => {
@@ -175,6 +247,8 @@ export default function App() {
 
   // Engine events
   useEffect(() => {
+    if (markdownSampleMode) return;
+
     const unsub = window.desktopAPI.onStreamEvent((ev) => {
       switch (ev.type) {
         case "text_delta":
@@ -234,7 +308,7 @@ export default function App() {
       setRunning(status.running);
     });
     return () => { unsub(); unsub2(); unsub3(); };
-  }, [loadSessions]);
+  }, [loadSessions, markdownSampleMode]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -341,6 +415,23 @@ export default function App() {
     }
   }, [input, running, sid, loadSessions]);
 
+  const cancelCurrentQuery = useCallback(() => {
+    if (!running) return;
+    void window.desktopAPI.cancelQuery();
+  }, [running]);
+
+  useEffect(() => {
+    if (!running) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      void window.desktopAPI.cancelQuery();
+    };
+    window.addEventListener("keydown", handleEscape, true);
+    return () => window.removeEventListener("keydown", handleEscape, true);
+  }, [running]);
+
   const handleKey = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -375,7 +466,7 @@ export default function App() {
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
               <path d="M2 4.5V11a1 1 0 001 1h8a1 1 0 001-1V5.5a1 1 0 00-1-1H7L5.5 3H3a1 1 0 00-1 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
-            <span className="workspace-path">{workspace.split("/").pop() || workspace}</span>
+            <span className="workspace-path">{displayWorkspacePath(workspace)}</span>
           </button>
           <button className="settings-btn" onClick={() => setShowSettings(!showSettings)} title="Settings">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
@@ -440,31 +531,21 @@ export default function App() {
       {/* ── Messages ── */}
       <div className="messages-wrap">
         {msgs.length === 0 ? (
-          <div className="empty">
+          markdownSampleMode ? (
+            <div className="messages">
+              <div className="msg msg-assistant">
+                <div className="avatar avatar-ai">
+                  <img src={kiraLogo} alt="" aria-hidden="true" />
+                </div>
+                <div className="msg-body">
+                  <MessageMarkdown text={MARKDOWN_SAMPLE} />
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="empty">
             <div className="empty-logo">
-              <svg width="56" height="56" viewBox="0 0 56 56" fill="none">
-                <path d="M28 4l4 16h-8l4-16z" fill="url(#hat1)"/>
-                <path d="M10 42c0-2 4-14 18-14s18 12 18 14H10z" fill="url(#hat2)"/>
-                <path d="M8 42h40v4H8v-4z" fill="url(#hat3)" rx="2"/>
-                <circle cx="28" cy="20" r="3" fill="#ffd700"/>
-                <circle cx="26" cy="28" r="1.5" fill="#ffd700" opacity="0.7"/>
-                <circle cx="32" cy="32" r="1.5" fill="#ffd700" opacity="0.7"/>
-                <circle cx="22" cy="35" r="1" fill="#ffd700" opacity="0.5"/>
-                <defs>
-                  <linearGradient id="hat1" x1="28" y1="4" x2="28" y2="20" gradientUnits="userSpaceOnUse">
-                    <stop stopColor="#8b5cf6"/>
-                    <stop offset="1" stopColor="#6c5ce7"/>
-                  </linearGradient>
-                  <linearGradient id="hat2" x1="28" y1="28" x2="28" y2="42" gradientUnits="userSpaceOnUse">
-                    <stop stopColor="#6c5ce7"/>
-                    <stop offset="1" stopColor="#4c3ed1"/>
-                  </linearGradient>
-                  <linearGradient id="hat3" x1="8" y1="42" x2="48" y2="46" gradientUnits="userSpaceOnUse">
-                    <stop stopColor="#4c3ed1"/>
-                    <stop offset="1" stopColor="#6c5ce7"/>
-                  </linearGradient>
-                </defs>
-              </svg>
+              <img src={kiraLogo} alt="Kira" />
             </div>
             <h2 className="empty-title">Kira</h2>
             <p className="empty-sub">你的全能 AI 搭子，随时待命</p>
@@ -476,23 +557,19 @@ export default function App() {
               ))}
             </div>
           </div>
+          )
         ) : (
           <div className="messages">
             {msgs.map((m) => (
               <div key={m.id} className={`msg msg-${m.role}`}>
                 {m.role === "assistant" && (
                   <div className="avatar avatar-ai">
-                    <svg width="18" height="18" viewBox="0 0 56 56" fill="none">
-                      <path d="M28 4l4 16h-8l4-16z" fill="#a78bfa"/>
-                      <path d="M10 42c0-2 4-14 18-14s18 12 18 14H10z" fill="#7c5cfc"/>
-                      <path d="M8 42h40v4H8v-4z" fill="#6c5ce7" rx="2"/>
-                      <circle cx="28" cy="20" r="3" fill="#ffd700"/>
-                    </svg>
+                    <img src={kiraLogo} alt="" aria-hidden="true" />
                   </div>
                 )}
                 <div className="msg-body">
                   {m.role === "tool" && <span className="tool-label">{m.toolName}</span>}
-                  <div className={`msg-text ${m.isError ? "msg-error" : ""}`}>{m.text}</div>
+                  <MessageMarkdown text={m.text} isError={m.isError} />
                 </div>
                 {m.role === "user" && <div className="avatar avatar-user">You</div>}
               </div>
@@ -500,12 +577,7 @@ export default function App() {
             {running && msgs[msgs.length - 1]?.role !== "assistant" && (
               <div className="msg msg-assistant">
                 <div className="avatar avatar-ai">
-                  <svg width="18" height="18" viewBox="0 0 56 56" fill="none">
-                    <path d="M28 4l4 16h-8l4-16z" fill="#a78bfa"/>
-                    <path d="M10 42c0-2 4-14 18-14s18 12 18 14H10z" fill="#7c5cfc"/>
-                    <path d="M8 42h40v4H8v-4z" fill="#6c5ce7" rx="2"/>
-                    <circle cx="28" cy="20" r="3" fill="#ffd700"/>
-                  </svg>
+                  <img src={kiraLogo} alt="" aria-hidden="true" />
                 </div>
                 <div className="msg-body">
                   <div className="typing"><span/><span/><span/></div>
@@ -532,7 +604,7 @@ export default function App() {
           />
           <div className="input-actions">
             {running ? (
-              <button className="btn-stop" onClick={() => window.desktopAPI.cancelQuery()} title="Stop">
+              <button className="btn-stop" onClick={cancelCurrentQuery} title="Stop">
                 <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
                   <rect x="2" y="2" width="10" height="10" rx="1"/>
                 </svg>

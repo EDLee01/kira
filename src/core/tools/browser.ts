@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { chromium, Browser, Page, ElementHandle } from "playwright";
 import { ToolError } from "./errors.ts";
 
@@ -30,7 +31,16 @@ let pageInstance: Page | null = null;
 
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.isConnected()) {
+    const executablePath = chromium.executablePath();
+    if (!existsSync(executablePath)) {
+      throw new ToolError([
+        "Playwright Chromium is not installed. Kira will not install browsers automatically.",
+        "Please approve and run this yourself first:",
+        "npx playwright install chromium"
+      ].join("\n"), "approval-required");
+    }
     browserInstance = await chromium.launch({
+      executablePath,
       headless: false,         // headed mode — the user can see what magi is doing
       args: [
         "--start-maximized",

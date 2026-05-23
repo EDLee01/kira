@@ -1,6 +1,6 @@
 {
   "name": "kira",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Kira — AI desktop assistant",
   "main": "dist/main/index.js",
@@ -24,6 +24,8 @@
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "ws": "^8.20.1",
     "yaml": "^2.7.0"
   },

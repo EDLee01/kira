@@ -123,7 +123,7 @@ function route(
       if (!sessionId || !text) { json(res, { error: "Missing sessionId or text" }, 400); return; }
       // Save user message
       if (!ctx.store.getSession(sessionId)) {
-        ctx.store.createSession({ id: sessionId, title: text.slice(0, 80), cwd: process.cwd() });
+        ctx.store.createSession({ id: sessionId, title: text.slice(0, 80), cwd: ctx.engine.cwd });
       }
       ctx.store.appendMessage({ sessionId, role: "user", content: JSON.stringify({ type: "text", text }), metadata: {} });
       json(res, { ok: true });
@@ -157,7 +157,7 @@ function route(
   if (pathname === "/api/sessions" && method === "POST") {
     readBody(req).then((body) => {
       const { title } = JSON.parse(body);
-      const id = ctx.store.createSession({ title: title ?? "Remote", cwd: process.cwd() });
+      const id = ctx.store.createSession({ title: title ?? "Remote", cwd: ctx.engine.cwd });
       json(res, { id });
     }).catch((e) => json(res, { error: e.message }, 500));
     return;

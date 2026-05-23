@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Kira logo">
+  <defs>
+    <linearGradient id="bg" x1="82" y1="48" x2="426" y2="466" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fbfcf8"/>
+      <stop offset="0.52" stop-color="#eff8f4"/>
+      <stop offset="1" stop-color="#e9ecff"/>
+    </linearGradient>
+    <radialGradient id="mintAura" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(392 106) rotate(132) scale(190 154)">
+      <stop offset="0" stop-color="#28f0cc"/>
+      <stop offset="0.58" stop-color="#7df4dc" stop-opacity="0.78"/>
+      <stop offset="1" stop-color="#7df4dc" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="violetAura" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(102 392) rotate(-28) scale(190 150)">
+      <stop offset="0" stop-color="#8c79ff"/>
+      <stop offset="0.52" stop-color="#8ec5ff" stop-opacity="0.74"/>
+      <stop offset="1" stop-color="#8ec5ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ink" x1="144" y1="112" x2="382" y2="418" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10151e"/>
+      <stop offset="1" stop-color="#252b37"/>
+    </linearGradient>
+    <linearGradient id="cyanEdge" x1="310" y1="128" x2="390" y2="234" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00d5c7"/>
+      <stop offset="1" stop-color="#57efb9"/>
+    </linearGradient>
+    <linearGradient id="violetEdge" x1="304" y1="300" x2="392" y2="412" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6f7cff"/>
+      <stop offset="1" stop-color="#38c0ff"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="340" y1="84" x2="412" y2="164" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17ddc5"/>
+      <stop offset="1" stop-color="#5a72ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M286 23c96 4 177 67 201 157 20 77-26 135-108 128-75-7-121-60-128-135-8-83 15-133 35-150z" fill="url(#mintAura)"/>
+  <path d="M16 343c52-58 143-78 218-35 73 42 92 119 43 168-53 53-151 41-216-16-40-35-57-78-45-117z" fill="url(#violetAura)"/>
+  <path d="M92 92c51-27 111-39 176-31" fill="none" stroke="#ffffff" stroke-width="18" stroke-linecap="round" opacity="0.55"/>
+  <path d="M153 151c0-20 16-36 36-36h8c20 0 36 16 36 36v210c0 20-16 36-36 36h-8c-20 0-36-16-36-36V151z" fill="url(#ink)"/>
+  <path d="M237 249 343 130c13-15 38-6 38 15v44c0 10-4 19-11 26l-69 68 83 99c13 15 2 38-18 38h-42c-11 0-21-5-27-14l-59-80c-17-23-17-55-1-77z" fill="url(#ink)"/>
+  <path d="M187 151c0-6 5-11 11-11s11 5 11 11v210c0 6-5 11-11 11s-11-5-11-11V151z" fill="#ffffff" opacity="0.17"/>
+  <path d="M305 251 372 178" fill="none" stroke="url(#cyanEdge)" stroke-width="18" stroke-linecap="round" opacity="0.88"/>
+  <path d="M313 315 376 391" fill="none" stroke="url(#violetEdge)" stroke-width="18" stroke-linecap="round" opacity="0.76"/>
+  <path d="M382 80 395 116 431 129 395 142 382 178 369 142 333 129 369 116 382 80z" fill="url(#spark)"/>
+  <circle cx="382" cy="129" r="9" fill="#ffffff" opacity="0.82"/>
+</svg>

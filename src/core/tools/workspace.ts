@@ -5,11 +5,19 @@ import { realpathSync } from "node:fs";
 import { ToolError } from "./errors.ts";
 
 export function resolveWorkspacePath(cwd: string, requestedPath: string): { absolutePath: string; relativePath: string } {
+  return resolveWorkspacePathFrom(cwd, cwd, requestedPath);
+}
+
+export function resolveWorkspacePathFrom(
+  cwd: string,
+  baseDir: string,
+  requestedPath: string
+): { absolutePath: string; relativePath: string } {
   if (!requestedPath.trim()) {
     throw new ToolError("Path must not be empty", "not-found");
   }
 
-  const absolutePath = path.resolve(cwd, requestedPath);
+  const absolutePath = path.resolve(baseDir, requestedPath);
 
   // Resolve symlinks on both sides so /var vs /private/var on macOS doesn't
   // create false "outside workspace" errors. Also prevents bypass via

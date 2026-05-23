@@ -5,17 +5,28 @@ import { startScheduler } from "./scheduler";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
 import { buildDesktopProvider } from "./desktop-provider";
+import { readDesktopSettings } from "./settings-store";
 
 let mainWindow: BrowserWindow | null = null;
 let stopScheduler: (() => void) | null = null;
 
+function readSchedulerWorkspace(): string {
+  const paths = getMagiPaths(process.env);
+  const workspace = readDesktopSettings(paths).workspace;
+  return workspace || process.cwd();
+}
+
 function createWindow(): void {
+  const appIcon = app.isPackaged
+    ? path.join(process.resourcesPath, "build", process.platform === "win32" ? "icon.ico" : "icon.png")
+    : path.join(__dirname, "..", "..", "build", process.platform === "win32" ? "icon.ico" : "icon.png");
   mainWindow = new BrowserWindow({
     width: 480,
     height: 860,
     minWidth: 380,
     minHeight: 600,
     title: "Kira",
+    icon: appIcon,
     backgroundColor: "#0a0a0f",
     webPreferences: {
       preload: path.join(__dirname, "..", "preload", "index.js"),
@@ -35,6 +46,7 @@ function createWindow(): void {
     paths,
     win: mainWindow,
     getProvider: () => buildDesktopProvider(paths),
+    getWorkspace: readSchedulerWorkspace,
   });
 
   if (process.env.NODE_ENV === "development") {

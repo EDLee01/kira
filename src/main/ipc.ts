@@ -1,4 +1,4 @@
-import { ipcMain, BrowserWindow, dialog } from "electron";
+import { ipcMain, BrowserWindow, dialog, shell } from "electron";
 import { Engine } from "./engine";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
@@ -21,6 +21,33 @@ import QRCode from "qrcode";
 import * as os from "os";
 import * as fs from "fs";
 import * as path from "path";
+
+function normalizeWorkspacePath(dir: string): string {
+  const trimmed = dir.trim();
+  if (!trimmed) {
+    throw new Error("Workspace path is empty");
+  }
+  const resolved = path.resolve(trimmed);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    throw new Error(`Workspace path does not exist: ${resolved}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new Error(`Workspace path is not a directory: ${resolved}`);
+  }
+  return resolved;
+}
+
+function tryNormalizeWorkspacePath(dir: string | undefined): string | null {
+  if (!dir) return null;
+  try {
+    return normalizeWorkspacePath(dir);
+  } catch {
+    return null;
+  }
+}
 
 export function registerIPC(win: BrowserWindow): void {
   const paths = getMagiPaths(process.env);
@@ -121,10 +148,21 @@ export function registerIPC(win: BrowserWindow): void {
 
   // ── Workspace ──
 
-  // Restore saved workspace
+  // Restore saved workspace. If the directory disappeared, do not keep showing
+  // a stale path that points somewhere the user cannot actually open.
   const savedSettings = readSettings();
-  if (savedSettings.workspace) {
-    engine.cwd = savedSettings.workspace;
+  const restoredWorkspace = tryNormalizeWorkspacePath(savedSettings.workspace);
+  if (restoredWorkspace) {
+    engine.cwd = restoredWorkspace;
+    if (restoredWorkspace !== savedSettings.workspace) {
+      const s = readSettings();
+      s.workspace = restoredWorkspace;
+      writeSettings(s);
+    }
+  } else if (savedSettings.workspace) {
+    const s = readSettings();
+    delete s.workspace;
+    writeSettings(s);
   }
 
   ipcMain.handle("workspace:get", () => {
@@ -137,10 +175,11 @@ export function registerIPC(win: BrowserWindow): void {
       title: "选择工作区",
     });
     if (!result.canceled && result.filePaths[0]) {
-      engine.cwd = result.filePaths[0];
+      const workspace = normalizeWorkspacePath(result.filePaths[0]);
+      engine.cwd = workspace;
       // Persist
       const s = readSettings();
-      s.workspace = result.filePaths[0];
+      s.workspace = workspace;
       writeSettings(s);
       return engine.cwd;
     }
@@ -148,9 +187,10 @@ export function registerIPC(win: BrowserWindow): void {
   });
 
   ipcMain.handle("workspace:set", (_event, dir: string) => {
-    engine.cwd = dir;
+    const workspace = normalizeWorkspacePath(dir);
+    engine.cwd = workspace;
     const s = readSettings();
-    s.workspace = dir;
+    s.workspace = workspace;
     writeSettings(s);
     return engine.cwd;
   });
@@ -339,6 +379,14 @@ export function registerIPC(win: BrowserWindow): void {
       nodeVersion: process.version,
     };
   });
+
+  ipcMain.handle("app:open-external", (_event, url: string) => {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:" && parsed.protocol !== "mailto:") {
+      throw new Error(`Unsupported URL protocol: ${parsed.protocol}`);
+    }
+    void shell.openExternal(parsed.toString());
+  });
 }
 
 function readProvider(value: string | undefined): DesktopProviderKind {
@@ -373,7 +421,7 @@ export function unregisterIPC(): void {
     "mcp:list", "mcp:add", "mcp:remove",
     "remote:start", "remote:stop", "remote:status",
     "config:get",
-    "app:info",
+    "app:info", "app:open-external",
   ];
   for (const h of handlers) {
     ipcMain.removeHandler(h);

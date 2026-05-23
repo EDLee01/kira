@@ -20,11 +20,12 @@ export interface SchedulerDeps {
     model: string;
     env: NodeJS.ProcessEnv;
   };
+  getWorkspace?: () => string;
   win: BrowserWindow;
 }
 
 export function startScheduler(deps: SchedulerDeps): () => void {
-  const { store, paths, getProvider, win } = deps;
+  const { store, paths, getProvider, getWorkspace, win } = deps;
   const cronPath = cronStorePathFromRoot(paths.stateRoot);
   let running = false;
 
@@ -50,10 +51,11 @@ export function startScheduler(deps: SchedulerDeps): () => void {
   }
 
   async function executeTask(item: CronRunResult) {
+    const cwd = getWorkspace?.() ?? process.cwd();
     const taskId = store.createAgentTask({
       role: "worker",
       prompt: item.prompt,
-      cwd: process.cwd(),
+      cwd,
       metadata: { cronJobId: item.job.id, cronExpression: item.job.cron },
     });
 
@@ -70,7 +72,7 @@ export function startScheduler(deps: SchedulerDeps): () => void {
         model: provider.model,
         providerName: provider.providerName,
         messages,
-        cwd: process.cwd(),
+        cwd,
         env: provider.env,
         permissionMode: "auto",
       })) {

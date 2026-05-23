@@ -31,7 +31,7 @@ import {
 } from "./git.ts";
 import { executeLspRequest, LSP_SCHEMA, parseLspRequest } from "./lsp.ts";
 import { formatSearchMatches, globWorkspace, searchWorkspace } from "./search.ts";
-import { runShellCommand } from "./shell.ts";
+import { findWorkspaceShellViolation, isDangerousShellCommand, runShellCommand } from "./shell.ts";
 import { formatMonitorResult, getMonitorData, MonitorInputSchema, parseMonitorInput } from "./monitor.ts";
 import { executeSleep, parseSleepInput, SleepInputSchema } from "./sleep.ts";
 import { executeFileCopy, formatFileCopyResult, FileCopyInputSchema, parseFileCopyInput } from "./file-copy.ts";
@@ -175,7 +175,7 @@ import {
 import { resolveWorkspacePath } from "./workspace.ts";
 import { WebSearchConfig } from "../config.ts";
 
-export type ToolPermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+export type ToolPermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "auto";
 export type ToolPermissionDecision = "allow" | "ask" | "deny";
 
 export interface ToolPermissionRules {
@@ -294,6 +294,7 @@ export async function executeRegisteredTool(input: {
     };
     const permission = checkToolPermission({
       toolUse: input.toolUse,
+      cwd: input.cwd,
       mode: context.permissionMode,
       rules: context.rules,
       tool,
@@ -386,6 +387,7 @@ export async function executeRegisteredTools(input: {
 
 export function checkToolPermission(input: {
   toolUse: MagiToolUsePart;
+  cwd?: string;
   mode: ToolPermissionMode;
   rules?: ToolPermissionRules;
   env?: NodeJS.ProcessEnv;
@@ -396,7 +398,7 @@ export function checkToolPermission(input: {
     return { decision: "deny", reason: `Unknown tool: ${input.toolUse.name}` };
   }
   const context: ToolExecutionContext = {
-    cwd: ".",
+    cwd: input.cwd ?? ".",
     permissionMode: input.mode,
     rules: input.rules,
     env: input.env
@@ -417,6 +419,9 @@ export function checkToolPermission(input: {
   }
   if (input.mode === "default" && !tool.isReadOnly(input.toolUse.input)) {
     return { decision: "ask", reason: `${input.toolUse.name} requires approval` };
+  }
+  if (input.mode === "auto" && !tool.isReadOnly(input.toolUse.input)) {
+    return { decision: "allow", reason: "auto mode" };
   }
   return { decision: "allow", reason: "read-only tool" };
 }
@@ -624,7 +629,8 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         cwd: context.cwd,
         command: readString(input, "command"),
         timeoutMs: readOptionalNumber(input, "timeout_ms"),
-        approveDangerous: context.env?.MAGI_APPROVE_DANGEROUS_COMMANDS === "1"
+        // Dangerous commands are gated by checkPermissions before this call.
+        approveDangerous: true
       });
       return [
         `Command exited ${result.exitCode}`,
@@ -634,6 +640,26 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     },
     isReadOnly: () => false,
     isDestructive: () => false,
+    checkPermissions: (input, context) => {
+      const command = readString(input, "command");
+      const workspaceViolation = findWorkspaceShellViolation({ cwd: context.cwd, command });
+      if (workspaceViolation) {
+        return {
+          decision: "deny",
+          reason: `Bash ${workspaceViolation.command} cannot mutate outside the workspace: ${workspaceViolation.path}`
+        };
+      }
+      if (!isDangerousShellCommand(command)) {
+        return undefined;
+      }
+      if (context.permissionMode === "bypassPermissions") {
+        return { decision: "allow", reason: "bypassPermissions mode" };
+      }
+      if (context.env?.MAGI_APPROVE_DANGEROUS_COMMANDS === "1") {
+        return { decision: "allow", reason: "dangerous commands explicitly approved by environment" };
+      }
+      return { decision: "ask", reason: "Bash command may install software or change system state" };
+    },
     isConcurrencySafe: () => false
   },
   {
@@ -1714,6 +1740,12 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     },
     isReadOnly: () => false,
     isDestructive: () => true,
+    checkPermissions: (_input, context) => {
+      if (context.permissionMode === "bypassPermissions") {
+        return { decision: "allow", reason: "bypassPermissions mode" };
+      }
+      return { decision: "ask", reason: "KillProcess can close a running application or system process" };
+    },
     isConcurrencySafe: () => false
   },
   {
@@ -2326,6 +2358,16 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         || action === "extract_text" || action === "wait" || action === "close";
     },
     isDestructive: () => false,
+    checkPermissions: (input, context) => {
+      if (context.permissionMode === "bypassPermissions") {
+        return undefined;
+      }
+      const action = String(input.action ?? "");
+      if (action === "click" || action === "type" || action === "evaluate") {
+        return { decision: "ask", reason: `Browser ${action} can interact with a live website` };
+      }
+      return undefined;
+    },
     isConcurrencySafe: () => false
   }
 ];

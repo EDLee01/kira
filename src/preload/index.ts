@@ -48,6 +48,7 @@ const api = {
 
   // App info
   getAppInfo: () => ipcRenderer.invoke("app:info"),
+  openExternal: (url: string) => ipcRenderer.invoke("app:open-external", url),
 
   // Events (renderer ← main)
   onStreamEvent: (callback: (event: any) => void) => {

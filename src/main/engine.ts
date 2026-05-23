@@ -14,7 +14,6 @@ import { buildDesktopProvider } from "./desktop-provider";
 
 export class Engine {
   private abortController: AbortController | null = null;
-  private queryTimeout: NodeJS.Timeout | null = null;
   private _running = false;
   private _sessionId: string | null = null;
   private _cwd: string = process.cwd();
@@ -56,9 +55,6 @@ export class Engine {
     this._running = true;
     this._sessionId = sessionId;
     this.abortController = new AbortController();
-    this.queryTimeout = setTimeout(() => {
-      this.abortController?.abort(new Error("Query timed out after 45 seconds"));
-    }, 45_000);
 
     try {
       const paths = getMagiPaths(process.env);
@@ -149,25 +145,63 @@ export class Engine {
         signal: this.abortController.signal,
         permissionMode: "auto",
         approvalResolver: async ({ toolUse, reason }) => {
-          if (toolUse.name !== "ComputerUse") {
+          let title = "Allow Kira to continue?";
+          let message = "Kira wants to perform an action that needs approval.";
+          let detail = reason;
+
+          if (toolUse.name === "ComputerUse") {
+            title = "Allow Kira to control the computer?";
+            message = "Kira wants to perform a desktop action.";
+            detail = [
+              reason,
+              "",
+              `Action: ${String(toolUse.input.action ?? "")}`,
+              toolUse.input.x !== undefined || toolUse.input.y !== undefined ? `Coordinates: (${toolUse.input.x ?? "?"}, ${toolUse.input.y ?? "?"})` : undefined,
+              toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
+              Array.isArray(toolUse.input.keys) ? `Keys: ${toolUse.input.keys.join("+")}` : undefined,
+              toolUse.input.key !== undefined ? `Key: ${String(toolUse.input.key)}` : undefined
+            ].filter((line): line is string => Boolean(line)).join("\n");
+          } else if (toolUse.name === "Bash") {
+            title = "Allow Kira to run this command?";
+            message = "Kira wants to run a command that may install software or change system state.";
+            detail = [
+              reason,
+              "",
+              `Command: ${String(toolUse.input.command ?? "").slice(0, 1000)}`
+            ].join("\n");
+          } else if (toolUse.name === "Browser") {
+            title = "Allow Kira to interact with the browser?";
+            message = "Kira wants to click, type, or run script in a live browser page.";
+            detail = [
+              reason,
+              "",
+              `Action: ${String(toolUse.input.action ?? "")}`,
+              toolUse.input.url !== undefined ? `URL: ${String(toolUse.input.url).slice(0, 500)}` : undefined,
+              toolUse.input.selector !== undefined ? `Selector: ${String(toolUse.input.selector).slice(0, 500)}` : undefined,
+              toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
+              toolUse.input.script !== undefined ? `Script: ${String(toolUse.input.script).slice(0, 500)}` : undefined
+            ].filter((line): line is string => Boolean(line)).join("\n");
+          } else if (toolUse.name === "KillProcess") {
+            title = "Allow Kira to close this process?";
+            message = "Kira wants to terminate a running process.";
+            detail = [
+              reason,
+              "",
+              toolUse.input.pid !== undefined ? `PID: ${String(toolUse.input.pid)}` : undefined,
+              toolUse.input.name !== undefined ? `Name: ${String(toolUse.input.name).slice(0, 300)}` : undefined,
+              toolUse.input.signal !== undefined ? `Signal: ${String(toolUse.input.signal)}` : undefined
+            ].filter((line): line is string => Boolean(line)).join("\n");
+          } else {
             return false;
           }
-          const detail = [
-            reason,
-            "",
-            `Action: ${String(toolUse.input.action ?? "")}`,
-            toolUse.input.x !== undefined || toolUse.input.y !== undefined ? `Coordinates: (${toolUse.input.x ?? "?"}, ${toolUse.input.y ?? "?"})` : undefined,
-            toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
-            Array.isArray(toolUse.input.keys) ? `Keys: ${toolUse.input.keys.join("+")}` : undefined,
-            toolUse.input.key !== undefined ? `Key: ${String(toolUse.input.key)}` : undefined
-          ].filter((line): line is string => Boolean(line)).join("\n");
+
           const result = await dialog.showMessageBox(this.win, {
             type: "warning",
             buttons: ["Allow", "Deny"],
             defaultId: 1,
             cancelId: 1,
-            title: "Allow Kira to control the computer?",
-            message: "Kira wants to perform a desktop action.",
+            title,
+            message,
             detail
           });
           return result.response === 0;
@@ -205,10 +239,6 @@ export class Engine {
         });
       }
     } finally {
-      if (this.queryTimeout) {
-        clearTimeout(this.queryTimeout);
-        this.queryTimeout = null;
-      }
       this._running = false;
       this._sessionId = null;
       this.abortController = null;
@@ -217,10 +247,6 @@ export class Engine {
   }
 
   cancelQuery(): void {
-    if (this.queryTimeout) {
-      clearTimeout(this.queryTimeout);
-      this.queryTimeout = null;
-    }
     this.abortController?.abort();
     this.abortController = null;
   }

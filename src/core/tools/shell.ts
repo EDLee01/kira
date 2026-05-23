@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import * as iconv from "iconv-lite";
 
 import { ToolError } from "./errors.ts";
+import { resolveWorkspacePathFrom } from "./workspace.ts";
 
 export interface ShellResult {
   command: string;
@@ -76,8 +77,224 @@ export function isDangerousShellCommand(command: string): boolean {
     /\bchmod\s+777\b/,
     />\s*\/etc\//,
     /\bcurl\b.*\|\s*(sh|bash)\b/,
-    /\bwget\b.*\|\s*(sh|bash)\b/
-  ].some((pattern) => pattern.test(normalized));
+    /\bwget\b.*\|\s*(sh|bash)\b/,
+    /\b(npm|pnpm|yarn|bun)\s+(install|add|i|ci)\b/,
+    /(^|[;&|]\s*)yarn\s*($|[;&|])/,
+    /\bnpx\s+playwright\s+install\b/,
+    /\bplaywright\s+install\b/,
+    /\bpython\s+-m\s+playwright\s+install\b/,
+    /\bpip3?\s+install\b/,
+    /\bpython\s+-m\s+pip\s+install\b/,
+    /\bbrew\s+install\b/,
+    /\b(cargo|gem)\s+install\b/,
+    /\bgo\s+install\b/,
+    /\bcomposer\s+global\s+require\b/,
+    /\b(winget|choco|scoop)\s+install\b/,
+    /\b(apt|apt-get|dnf|yum|pacman|zypper)\s+install\b/
+  ].some((pattern) => pattern.test(normalized)) || hasInlineCodeExecution(command);
+}
+
+export interface WorkspaceShellViolation {
+  command: string;
+  path: string;
+  reason: string;
+}
+
+const FILE_MUTATION_COMMANDS = new Set([
+  "cp",
+  "mv",
+  "move",
+  "rm",
+  "del",
+  "erase",
+  "mkdir",
+  "md",
+  "rmdir",
+  "rd",
+  "touch",
+  "ln",
+  "ren",
+  "rename",
+  "chmod",
+  "chown",
+  "install",
+  "tee",
+  "copy",
+  "xcopy",
+  "robocopy",
+  "cpi",
+  "mi",
+  "ri",
+  "ni",
+  "rni",
+  "ac",
+  "clc",
+  "move-item",
+  "copy-item",
+  "remove-item",
+  "new-item",
+  "rename-item",
+  "set-content",
+  "add-content",
+  "clear-content",
+  "out-file"
+]);
+
+const COMMAND_SEPARATORS = new Set([";", "&&", "||", "|"]);
+const POWERSHELL_FILE_COMMANDS = new Set([
+  "copy-item",
+  "move-item",
+  "remove-item",
+  "new-item",
+  "rename-item",
+  "set-content",
+  "add-content",
+  "clear-content",
+  "out-file",
+  "cp",
+  "copy",
+  "cpi",
+  "mv",
+  "move",
+  "mi",
+  "rm",
+  "del",
+  "erase",
+  "rmdir",
+  "rd",
+  "ri",
+  "mkdir",
+  "md",
+  "ni",
+  "ren",
+  "rni",
+  "ac",
+  "clc"
+]);
+
+export function findWorkspaceShellViolation(input: {
+  cwd: string;
+  command: string;
+}): WorkspaceShellViolation | undefined {
+  return findWorkspaceShellViolationInternal({
+    cwd: input.cwd,
+    command: input.command,
+    initialDir: input.cwd,
+    depth: 0,
+    variables: createShellVariableMap(input.cwd)
+  });
+}
+
+function findWorkspaceShellViolationInternal(input: {
+  cwd: string;
+  command: string;
+  initialDir: string;
+  depth: number;
+  variables: Map<string, string>;
+}): WorkspaceShellViolation | undefined {
+  const tokens = tokenizeShellCommand(input.command);
+  let currentDir = input.initialDir;
+  const variables = new Map(input.variables);
+
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (COMMAND_SEPARATORS.has(token)) {
+      continue;
+    }
+
+    const assignment = parseShellAssignment(token);
+    if (assignment) {
+      variables.set(assignment.name, expandShellPathToken(assignment.value, variables));
+      continue;
+    }
+
+    const redirection = parseOutputRedirection(tokens, index);
+    if (redirection) {
+      const expandedPath = expandShellPathToken(redirection.path, variables);
+      if (hasUnresolvedShellPathSyntax(expandedPath)) {
+        return {
+          command: "redirect",
+          path: expandedPath,
+          reason: "output redirection target uses dynamic shell expansion and cannot be verified"
+        };
+      }
+      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath);
+      if (!resolved.ok) {
+        return {
+          command: "redirect",
+          path: expandedPath,
+          reason: "output redirection target is outside the workspace"
+        };
+      }
+      index = redirection.index;
+      continue;
+    }
+
+    const commandName = normalizeCommandName(token);
+    const nestedShellCommand = readNestedShellCommand(commandName, tokens, index);
+    if (nestedShellCommand && input.depth < 3) {
+      const violation = findWorkspaceShellViolationInternal({
+        cwd: input.cwd,
+        command: nestedShellCommand.command,
+        initialDir: currentDir,
+        depth: input.depth + 1,
+        variables
+      });
+      if (violation) return violation;
+      index = nestedShellCommand.index;
+      continue;
+    }
+    const inlineCode = readInlineCodeCommand(commandName, tokens, index);
+    if (inlineCode) {
+      const violation = findInlineCodeViolation({
+        cwd: input.cwd,
+        currentDir,
+        command: commandName,
+        code: inlineCode.code,
+        variables
+      });
+      if (violation) return violation;
+      index = inlineCode.index;
+      continue;
+    }
+
+    if (commandName === "cd" || commandName === "chdir" || commandName === "set-location") {
+      const next = nextShellArgument(tokens, index + 1, commandName);
+      if (!next) {
+        currentDir = input.cwd;
+        continue;
+      }
+      const expandedPath = expandShellPathToken(next.value, variables);
+      if (hasUnresolvedShellPathSyntax(expandedPath)) {
+        return {
+          command: "cd",
+          path: expandedPath,
+          reason: "cd target uses dynamic shell expansion and cannot be verified"
+        };
+      }
+      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath);
+      if (!resolved.ok) {
+        return { command: "cd", path: expandedPath, reason: "cd target is outside the workspace" };
+      }
+      currentDir = resolved.absolutePath;
+      index = next.index;
+      continue;
+    }
+
+    if (FILE_MUTATION_COMMANDS.has(commandName)) {
+      const violation = findFileMutationViolation({
+        cwd: input.cwd,
+        currentDir,
+        command: commandName,
+        tokens,
+        startIndex: index + 1,
+        variables
+      });
+      if (violation) return violation;
+    }
+  }
+
+  return undefined;
 }
 
 export async function runShellCommand(input: {
@@ -90,6 +307,10 @@ export async function runShellCommand(input: {
 }): Promise<ShellResult> {
   if (isDangerousShellCommand(input.command) && !input.approveDangerous) {
     throw new ToolError(`Command requires explicit approval: ${input.command}`, "approval-required");
+  }
+  const workspaceViolation = findWorkspaceShellViolation(input);
+  if (workspaceViolation) {
+    throw new ToolError(formatWorkspaceShellViolation(workspaceViolation), "outside-workspace");
   }
 
   const isWindows = process.platform === "win32";
@@ -277,6 +498,458 @@ export async function runShellCommand(input: {
       finish(exitCode ?? exitCodeFromExit);
     });
   });
+}
+
+function findFileMutationViolation(input: {
+  cwd: string;
+  currentDir: string;
+  command: string;
+  tokens: string[];
+  startIndex: number;
+  variables: Map<string, string>;
+}): WorkspaceShellViolation | undefined {
+  for (let index = input.startIndex; index < input.tokens.length; index++) {
+    const token = input.tokens[index];
+    if (COMMAND_SEPARATORS.has(token)) break;
+    const pathOption = readPowerShellPathOption(input.command, input.tokens, index);
+    if (pathOption) {
+      const expandedPath = expandShellPathToken(pathOption.path, input.variables);
+      if (hasUnresolvedShellPathSyntax(expandedPath)) {
+        return {
+          command: input.command,
+          path: expandedPath,
+          reason: `${input.command} path uses dynamic shell expansion and cannot be verified`
+        };
+      }
+      const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+      if (!resolved.ok) {
+        return {
+          command: input.command,
+          path: expandedPath,
+          reason: `${input.command} path is outside the workspace`
+        };
+      }
+      index = pathOption.index;
+      continue;
+    }
+    if (!shouldTreatAsPathArgument(input.command, token)) {
+      if (shouldSkipPowerShellValueArgument(input.command, token)) index++;
+      continue;
+    }
+
+    const expandedPath = expandShellPathToken(token, input.variables);
+    if (hasUnresolvedShellPathSyntax(expandedPath)) {
+      return {
+        command: input.command,
+        path: expandedPath,
+        reason: `${input.command} path uses dynamic shell expansion and cannot be verified`
+      };
+    }
+    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+    if (!resolved.ok) {
+      return {
+        command: input.command,
+        path: expandedPath,
+        reason: `${input.command} path is outside the workspace`
+      };
+    }
+  }
+  return undefined;
+}
+
+function shouldTreatAsPathArgument(command: string, token: string): boolean {
+  if (!token || token === "--") return false;
+  if (isShellOptionToken(token)) return false;
+  if (isPowerShellNamedParameter(token)) return false;
+  if (isOutputRedirectionToken(token)) return false;
+  if (command === "chmod" && /^[0-7]{3,4}$/.test(token)) return false;
+  if (command === "chown" && /^[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?$/.test(token) && !token.includes("/") && !token.startsWith(".")) return false;
+  return true;
+}
+
+function parseOutputRedirection(tokens: string[], index: number): { path: string; index: number } | undefined {
+  const token = tokens[index];
+  if (isOutputRedirectionToken(token)) {
+    const next = tokens[index + 1];
+    if (!next || COMMAND_SEPARATORS.has(next) || isDescriptorRedirect(next)) return undefined;
+    return { path: next, index: index + 1 };
+  }
+  const inline = /^(?:\d*>>?|\d*>\||&>>?)(.+)$/.exec(token);
+  if (!inline || isDescriptorRedirect(token)) return undefined;
+  return { path: inline[1], index };
+}
+
+function isOutputRedirectionToken(token: string): boolean {
+  return /^(?:\d*>>?|\d*>\||&>>?)$/.test(token);
+}
+
+function isDescriptorRedirect(token: string): boolean {
+  return /^\d*>\&\d+$/.test(token) || /^\d*>\&-$/.test(token);
+}
+
+function resolveShellPath(cwd: string, baseDir: string, requestedPath: string):
+  | { ok: true; absolutePath: string }
+  | { ok: false } {
+  try {
+    return { ok: true, absolutePath: resolveWorkspacePathFrom(cwd, baseDir, requestedPath).absolutePath };
+  } catch (error) {
+    if (error instanceof ToolError && error.kind === "outside-workspace") {
+      return { ok: false };
+    }
+    throw error;
+  }
+}
+
+function formatWorkspaceShellViolation(violation: WorkspaceShellViolation): string {
+  return `Shell command denied: ${violation.reason}: ${violation.path}. Kira can only mutate files inside the selected workspace.`;
+}
+
+function nextShellArgument(tokens: string[], startIndex: number, command = ""): { value: string; index: number } | undefined {
+  for (let index = startIndex; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (COMMAND_SEPARATORS.has(token)) return undefined;
+    if (isShellOptionToken(token)) {
+      if (shouldSkipPowerShellValueArgument(command, token)) index++;
+      continue;
+    }
+    return { value: token, index };
+  }
+  return undefined;
+}
+
+function tokenizeShellCommand(command: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | undefined;
+  let escaped = false;
+
+  const push = () => {
+    if (!current) return;
+    tokens.push(current);
+    current = "";
+  };
+
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\" && shouldTreatBackslashAsEscape(command, index)) {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = undefined;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      push();
+      continue;
+    }
+    const two = command.slice(index, index + 2);
+    if (two === "&&" || two === "||") {
+      push();
+      tokens.push(two);
+      index++;
+      continue;
+    }
+    if (char === ";" || char === "|") {
+      push();
+      tokens.push(char);
+      continue;
+    }
+    current += char;
+  }
+  push();
+  return tokens;
+}
+
+function parseShellAssignment(token: string): { name: string; value: string } | undefined {
+  const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(token);
+  if (!match) return undefined;
+  return { name: match[1], value: match[2] };
+}
+
+function normalizeCommandName(token: string): string {
+  const normalized = token.toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/i, "");
+  return basename(normalized);
+}
+
+function readNestedShellCommand(
+  commandName: string,
+  tokens: string[],
+  commandIndex: number
+): { command: string; index: number } | undefined {
+  if (commandName === "cmd") {
+    return readCommandAfterOption(tokens, commandIndex + 1, ["/c", "/k"]);
+  }
+  if (commandName === "powershell" || commandName === "pwsh") {
+    return readCommandAfterOption(tokens, commandIndex + 1, ["-command", "-c", "/c"]);
+  }
+  if (commandName === "bash" || commandName === "sh" || commandName === "zsh") {
+    return readCommandAfterOption(tokens, commandIndex + 1, ["-c", "-lc"]);
+  }
+  return undefined;
+}
+
+function readInlineCodeCommand(
+  commandName: string,
+  tokens: string[],
+  commandIndex: number
+): { code: string; index: number } | undefined {
+  const codeOptions = inlineCodeOptionsForCommand(commandName);
+  if (codeOptions.length === 0) return undefined;
+  for (let index = commandIndex + 1; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (COMMAND_SEPARATORS.has(token)) return undefined;
+    if (!codeOptions.includes(token.toLowerCase())) continue;
+    const next = tokens[index + 1];
+    if (!next || COMMAND_SEPARATORS.has(next)) return undefined;
+    return { code: next, index: index + 1 };
+  }
+  return undefined;
+}
+
+function inlineCodeOptionsForCommand(commandName: string): string[] {
+  if (commandName === "python" || commandName === "python3" || commandName === "py") return ["-c"];
+  if (commandName === "node" || commandName === "deno" || commandName === "bun") return ["-e", "--eval", "--print", "-p"];
+  if (commandName === "ruby" || commandName === "perl" || commandName === "php") return ["-e", "-r"];
+  if (commandName === "osascript") return ["-e"];
+  return [];
+}
+
+function hasInlineCodeExecution(command: string): boolean {
+  const tokens = tokenizeShellCommand(command);
+  for (let index = 0; index < tokens.length; index++) {
+    const commandName = normalizeCommandName(tokens[index]);
+    if (readInlineCodeCommand(commandName, tokens, index)) return true;
+  }
+  return false;
+}
+
+function findInlineCodeViolation(input: {
+  cwd: string;
+  currentDir: string;
+  command: string;
+  code: string;
+  variables: Map<string, string>;
+}): WorkspaceShellViolation | undefined {
+  if (!inlineCodeMayMutate(input.code)) return undefined;
+  const literals = extractPathLikeLiterals(input.code);
+  if (literals.length === 0) {
+    return {
+      command: input.command,
+      path: input.code,
+      reason: `${input.command} inline code may mutate files but no static path could be verified`
+    };
+  }
+  for (const literal of literals) {
+    const expandedPath = expandShellPathToken(literal, input.variables);
+    if (hasUnresolvedShellPathSyntax(expandedPath)) {
+      return {
+        command: input.command,
+        path: expandedPath,
+        reason: `${input.command} inline code uses dynamic shell expansion and cannot be verified`
+      };
+    }
+    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+    if (!resolved.ok) {
+      return {
+        command: input.command,
+        path: expandedPath,
+        reason: `${input.command} inline code may mutate outside the workspace`
+      };
+    }
+  }
+  return undefined;
+}
+
+function inlineCodeMayMutate(code: string): boolean {
+  return /\b(unlink|remove|rename|rmdir|mkdir|writeFile|appendFile|rmSync|unlinkSync|renameSync|mkdirSync|rmdirSync|writeFileSync|appendFileSync|openSync|createWriteStream|copyFile|copyFileSync|Move-Item|Copy-Item|Remove-Item|New-Item|Set-Content|Add-Content|Clear-Content)\b/i.test(code);
+}
+
+function extractPathLikeLiterals(code: string): string[] {
+  const literals: string[] = [];
+  const pattern = /(["'`])((?:\\.|(?!\1).)+)\1/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(code)) !== null) {
+    const value = unescapeInlineLiteral(match[2]);
+    if (looksLikePathLiteral(value)) literals.push(value);
+  }
+  return literals;
+}
+
+function unescapeInlineLiteral(value: string): string {
+  return value
+    .replace(/\\(["'`\\])/g, "$1")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t");
+}
+
+function looksLikePathLiteral(value: string): boolean {
+  return value.startsWith("/")
+    || value.startsWith("./")
+    || value.startsWith("../")
+    || value.startsWith("~/")
+    || /^[A-Za-z]:[\\/]/.test(value)
+    || value.includes("\\")
+    || value.includes("/");
+}
+
+function readCommandAfterOption(
+  tokens: string[],
+  startIndex: number,
+  optionNames: string[]
+): { command: string; index: number } | undefined {
+  for (let index = startIndex; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (COMMAND_SEPARATORS.has(token)) return undefined;
+    const normalized = token.toLowerCase();
+    if (!optionNames.includes(normalized)) continue;
+    const commandStart = index + 1;
+    const commandEnd = findCommandSegmentEnd(tokens, commandStart);
+    if (commandEnd <= commandStart) return undefined;
+    return {
+      command: tokens.slice(commandStart, commandEnd).join(" "),
+      index: commandEnd - 1
+    };
+  }
+  return undefined;
+}
+
+function findCommandSegmentEnd(tokens: string[], startIndex: number): number {
+  for (let index = startIndex; index < tokens.length; index++) {
+    if (COMMAND_SEPARATORS.has(tokens[index])) return index;
+  }
+  return tokens.length;
+}
+
+function shouldTreatBackslashAsEscape(command: string, index: number): boolean {
+  if (looksLikeWindowsShell(command)) return false;
+  const next = command[index + 1];
+  return next !== undefined;
+}
+
+function looksLikeWindowsShell(command: string): boolean {
+  return /(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)\b/i.test(command)
+    || /\b[A-Za-z]:\\/.test(command)
+    || /\\\\[A-Za-z0-9_.-]+\\/.test(command);
+}
+
+function isShellOptionToken(token: string): boolean {
+  return token.startsWith("-") || /^\/[A-Za-z?][A-Za-z0-9?]*:?$/i.test(token);
+}
+
+function shouldSkipPowerShellValueArgument(command: string, token: string): boolean {
+  if (!isPowerShellFileCommand(command)) return false;
+  return [
+    "-name",
+    "-itemtype",
+    "-type",
+    "-value",
+    "-encoding",
+    "-filter",
+    "-include",
+    "-exclude",
+    "-credential",
+    "-stream"
+  ].includes(token.toLowerCase());
+}
+
+function readPowerShellPathOption(command: string, tokens: string[], index: number): { path: string; index: number } | undefined {
+  if (!isPowerShellFileCommand(command)) return undefined;
+  const token = tokens[index].toLowerCase();
+  if (![
+    "-path",
+    "-literalpath",
+    "-destination",
+    "-target",
+    "-filepath"
+  ].includes(token)) {
+    return undefined;
+  }
+  const next = tokens[index + 1];
+  if (!next || COMMAND_SEPARATORS.has(next)) return undefined;
+  return { path: next, index: index + 1 };
+}
+
+function isPowerShellFileCommand(command: string): boolean {
+  return command.includes("-") || POWERSHELL_FILE_COMMANDS.has(command);
+}
+
+function isPowerShellNamedParameter(token: string): boolean {
+  return /^-[A-Za-z][A-Za-z0-9-]*$/.test(token);
+}
+
+function createShellVariableMap(cwd: string): Map<string, string> {
+  const variables = new Map<string, string>();
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) variables.set(key, value);
+  }
+  variables.set("PWD", cwd);
+  variables.set("OLDPWD", cwd);
+  if (process.env.HOME) variables.set("HOME", process.env.HOME);
+  if (process.env.USERPROFILE) variables.set("USERPROFILE", process.env.USERPROFILE);
+  if (process.env.TMPDIR) variables.set("TMPDIR", process.env.TMPDIR);
+  if (process.env.TEMP) variables.set("TEMP", process.env.TEMP);
+  if (process.env.TMP) variables.set("TMP", process.env.TMP);
+  return variables;
+}
+
+function expandShellPathToken(token: string, variables: Map<string, string>): string {
+  let expanded = token;
+  if (expanded === "~") {
+    expanded = readShellVariable(variables, "HOME") ?? expanded;
+  } else if (expanded.startsWith("~/")) {
+    const home = readShellVariable(variables, "HOME");
+    if (home) expanded = join(home, expanded.slice(2));
+  } else if (expanded.startsWith("~\\")) {
+    const home = readShellVariable(variables, "HOME") ?? readShellVariable(variables, "USERPROFILE");
+    if (home) expanded = join(home, expanded.slice(2));
+  }
+  expanded = expanded.replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gi, (_match, name: string) => {
+    return readShellVariable(variables, name) ?? _match;
+  });
+  expanded = expanded.replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (_match, name: string) => {
+    return readShellVariable(variables, name) ?? _match;
+  });
+  expanded = expanded.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
+    return readShellVariable(variables, name) ?? _match;
+  });
+  expanded = expanded.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name: string) => {
+    return readShellVariable(variables, name) ?? _match;
+  });
+  expanded = expanded.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (_match, name: string) => {
+    return readShellVariable(variables, name) ?? _match;
+  });
+  return expanded;
+}
+
+function readShellVariable(variables: Map<string, string>, name: string): string | undefined {
+  const direct = variables.get(name) ?? variables.get(name.toUpperCase()) ?? variables.get(name.toLowerCase());
+  if (direct !== undefined) return direct;
+  const lower = name.toLowerCase();
+  for (const [key, value] of variables) {
+    if (key.toLowerCase() === lower) return value;
+  }
+  return undefined;
+}
+
+function hasUnresolvedShellPathSyntax(token: string): boolean {
+  return token.startsWith("~")
+    || /\$\{?[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?\}?/.test(token)
+    || /%[A-Za-z_][A-Za-z0-9_]*%/.test(token)
+    || /\$\(|`|<\(|>\(/.test(token);
 }
 
 async function runPosixBackgroundCommand(input: {
