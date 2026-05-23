@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as iconv from "iconv-lite";
@@ -92,34 +93,24 @@ export async function runShellCommand(input: {
   }
 
   const isWindows = process.platform === "win32";
-  if (!isWindows && !input.skipAutoBackground && isLongRunningCommand(input.command)) {
-    const logFile = join(tmpdir(), `magi-desktop-bg-${Date.now()}.log`);
-    const escaped = input.command.replace(/'/g, "'\\''");
-    const bgCommand = `nohup bash -c '${escaped}' > ${logFile} 2>&1 < /dev/null & disown; echo "BG_PID=$!"`;
-    const bgResult = await runShellCommand({ ...input, command: bgCommand, skipAutoBackground: true });
-    return {
-      ...bgResult,
-      command: input.command,
-      stdout:
-        `[Auto-backgrounded] Process detached from shell. The process IS running - DO NOT try to verify by re-running it.\n` +
-        `Log file: ${logFile}\n` +
-        `To check output: cat ${logFile}\n` +
-        `To stop: pkill -f '${input.command.split(/\s+/)[0]}'\n` +
-        `Wait 3-5 seconds before checking the log for the URL/port.\n` +
-        bgResult.stdout,
-    };
+  if (!input.skipAutoBackground && isLongRunningCommand(input.command)) {
+    if (isWindows) {
+      return runWindowsBackgroundCommand(input);
+    }
+    return runPosixBackgroundCommand(input);
   }
 
   return new Promise((resolve, reject) => {
     const shellCmd = isWindows ? "cmd.exe" : "bash";
     // On Windows, prefix with `chcp 65001 >nul` to switch to UTF-8 codepage
     const winCommand = `chcp 65001 >nul && ${input.command}`;
-    const shellArgs = isWindows ? ["/c", winCommand] : ["-lc", input.command];
+    const shellArgs = isWindows ? ["/d", "/s", "/c", winCommand] : ["-lc", input.command];
     const child = spawn(shellCmd, shellArgs, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: isWindows ? { ...process.env, PYTHONIOENCODING: "utf-8" } : process.env,
-      detached: !isWindows
+      detached: !isWindows,
+      windowsHide: isWindows
     });
     let stdout = "";
     let stderr = "";
@@ -142,36 +133,17 @@ export async function runShellCommand(input: {
     const truncNoteBuffer = Buffer.from(TRUNC_NOTE, "utf8");
 
     const killTree = (sig: NodeJS.Signals = "SIGTERM") => {
-      if (!isWindows) {
-        try {
-          if (child.pid) process.kill(-child.pid, sig);
-          return;
-        } catch {
-          // Fall through to killing the shell process only.
-        }
+      if (isWindows) {
+        killWindowsProcessTree(child.pid);
+        return;
       }
-      try { child.kill(sig); } catch {}
-    };
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killTree("SIGTERM");
-      killTimer = setTimeout(() => killTree("SIGKILL"), 2000);
-    }, input.timeoutMs ?? 30_000);
-
-    const onAbort = () => {
-      aborted = true;
-      clearTimeout(timer);
-      killTree("SIGTERM");
-      killTimer = setTimeout(() => killTree("SIGKILL"), 1000);
-    };
-    if (input.signal) {
-      if (input.signal.aborted) {
-        onAbort();
-      } else {
-        input.signal.addEventListener("abort", onAbort);
+      try {
+        if (child.pid) process.kill(-child.pid, sig);
+        return;
+      } catch {
+        try { child.kill(sig); } catch {}
       }
-    }
+    };
 
     const decode = (buf: Buffer): string => {
       if (!isWindows) return buf.toString("utf8");
@@ -243,6 +215,31 @@ export async function runShellCommand(input: {
         timedOut
       });
     };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => {
+        killTree("SIGKILL");
+        finish(exitCodeFromExit, true);
+      }, 2000);
+    }, input.timeoutMs ?? 30_000);
+
+    const onAbort = () => {
+      aborted = true;
+      clearTimeout(timer);
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => {
+        killTree("SIGKILL");
+        finish(exitCodeFromExit, true);
+      }, 1000);
+    };
+    if (input.signal) {
+      if (input.signal.aborted) {
+        onAbort();
+      } else {
+        input.signal.addEventListener("abort", onAbort);
+      }
+    }
     const maybeFinishAfterExit = () => {
       if (exitCodeFromExit === null || !stdoutEnded || !stderrEnded) return;
       finish(exitCodeFromExit);
@@ -280,4 +277,97 @@ export async function runShellCommand(input: {
       finish(exitCode ?? exitCodeFromExit);
     });
   });
+}
+
+async function runPosixBackgroundCommand(input: {
+  cwd: string;
+  command: string;
+  timeoutMs?: number;
+  approveDangerous?: boolean;
+  signal?: AbortSignal;
+  skipAutoBackground?: boolean;
+}): Promise<ShellResult> {
+  const logFile = join(tmpdir(), `magi-desktop-bg-${Date.now()}.log`);
+  const escaped = input.command.replace(/'/g, "'\\''");
+  const bgCommand = `nohup bash -c '${escaped}' > ${logFile} 2>&1 < /dev/null & disown; echo "BG_PID=$!"`;
+  const bgResult = await runShellCommand({ ...input, command: bgCommand, skipAutoBackground: true });
+  return {
+    ...bgResult,
+    command: input.command,
+    stdout:
+      `[Auto-backgrounded] Process detached from shell. The process IS running - DO NOT try to verify by re-running it.\n` +
+      `Log file: ${logFile}\n` +
+      `To check output: cat ${logFile}\n` +
+      `To stop: pkill -f '${input.command.split(/\s+/)[0]}'\n` +
+      `Wait 3-5 seconds before checking the log for the URL/port.\n` +
+      bgResult.stdout,
+  };
+}
+
+async function runWindowsBackgroundCommand(input: {
+  cwd: string;
+  command: string;
+  timeoutMs?: number;
+  approveDangerous?: boolean;
+  signal?: AbortSignal;
+  skipAutoBackground?: boolean;
+}): Promise<ShellResult> {
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const logFile = join(tmpdir(), `magi-desktop-bg-${stamp}.log`);
+  const scriptFile = join(tmpdir(), `magi-desktop-bg-${stamp}.cmd`);
+  writeFileSync(scriptFile, [
+    "@echo off",
+    "chcp 65001 >nul",
+    `cd /d ${quoteCmdPath(input.cwd)}`,
+    `${input.command} > ${quoteCmdPath(logFile)} 2>&1`
+  ].join("\r\n"), "utf8");
+
+  const psCommand = [
+    "$ErrorActionPreference = 'Stop'",
+    `$script = ${quotePowerShellString(scriptFile)}`,
+    `$workdir = ${quotePowerShellString(input.cwd)}`,
+    "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d','/s','/c', ('\"' + $script + '\"')) -WorkingDirectory $workdir -WindowStyle Hidden -PassThru",
+    "Write-Output ('BG_PID=' + $p.Id)"
+  ].join("; ");
+
+  const bgResult = await runShellCommand({
+    ...input,
+    command: `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ${quoteCmdArgument(psCommand)}`,
+    skipAutoBackground: true
+  });
+  const pid = /BG_PID=(\d+)/.exec(bgResult.stdout)?.[1];
+  return {
+    ...bgResult,
+    command: input.command,
+    stdout:
+      `[Auto-backgrounded] Process detached from shell. The process IS running - DO NOT try to verify by re-running it.\n` +
+      `Log file: ${logFile}\n` +
+      `To check output: type ${quoteCmdPath(logFile)}\n` +
+      `To stop: ${pid ? `taskkill /PID ${pid} /T /F` : "use Task Manager or taskkill to stop the process"}\n` +
+      `Wait 3-5 seconds before checking the log for the URL/port.\n` +
+      bgResult.stdout,
+  };
+}
+
+function killWindowsProcessTree(pid: number | undefined): void {
+  if (!pid) return;
+  try {
+    const killer = spawn("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true
+    });
+    killer.on("error", () => {});
+  } catch {}
+}
+
+function quoteCmdPath(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteCmdArgument(value: string): string {
+  return `"${value.replace(/(["^&|<>])/g, "^$1").replace(/%/g, "%%")}"`;
+}
+
+function quotePowerShellString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
 }
