@@ -585,6 +585,15 @@ body {
   font-weight: 400;
   letter-spacing: 0.2px;
 }
+.ai-disclaimer {
+  text-align: center;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--fg3);
+  opacity: 0.72;
+  margin-top: 3px;
+  font-weight: 400;
+}
 
 /* ── Settings Button ── */
 .settings-btn {

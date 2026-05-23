@@ -6,6 +6,7 @@ import {
   ProviderRequest,
   ProviderResponse,
   ProviderUsage,
+  parsePromptIntoParts,
   textMessage
 } from "../providers/ir.ts";
 import { ProviderError } from "../providers/errors.ts";
@@ -264,6 +265,7 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
       }
       const toolResults = executed.results;
       const toolResultMessages: MagiMessage[] = [];
+      const toolImageMessages: MagiMessage[] = [];
       const hookMessages: MagiMessage[] = [];
       for (const result of toolResults) {
         if (result.permission?.decision === "ask") {
@@ -286,16 +288,31 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
           isError: result.isError,
           retryable: result.retryable
         };
+        const parsedResultParts = parsePromptIntoParts(result.content);
+        const imageParts = parsedResultParts.filter((part) => part.type === "image");
+        const textWithoutImages = parsedResultParts
+          .filter((part) => part.type !== "image")
+          .map((part) => part.type === "text" ? part.text : "")
+          .join("");
         toolResultMessages.push({
           role: "tool",
           content: [{
             type: "tool-result",
             toolCallId: result.toolCallId,
-            content: result.content,
+            content: textWithoutImages,
             isError: result.isError,
             retryable: result.retryable
           }]
         });
+        if (imageParts.length > 0) {
+          toolImageMessages.push({
+            role: "user",
+            content: [
+              { type: "text", text: `Image output from ${result.toolName}. Analyze this screenshot directly; do not infer from the text summary alone.` },
+              ...imageParts
+            ]
+          });
+        }
         const postHooks = await executeHooks({
           event: result.isError ? "post_tool_use_failure" : "post_tool_use",
           hooks: input.hooks ?? [],
@@ -324,7 +341,7 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
           }
         }
       }
-      messages.push(...toolResultMessages, ...hookMessages);
+      messages.push(...toolResultMessages, ...toolImageMessages, ...hookMessages);
     }
 
     yield { type: "max_turns_reached" };

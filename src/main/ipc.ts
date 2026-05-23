@@ -3,6 +3,7 @@ import { Engine } from "./engine";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
 import { loadConfig } from "../core/config.ts";
+import { executeGoalCommand } from "../core/goal.ts";
 import { listCronJobs, applyCronUpdate, deleteCronJob, cronStorePathFromRoot } from "../core/tools/cron.ts";
 import { startRemoteServer, stopRemoteServer, isRunning as isRemoteRunning, getToken, getConnectedClients, broadcast } from "./remote-server";
 import { startTunnel, stopTunnel, getTunnelUrl, isTunnelRunning } from "./tunnel";
@@ -87,6 +88,26 @@ export function registerIPC(win: BrowserWindow): void {
 
   ipcMain.handle("engine:status", () => {
     return { running: engine.running, sessionId: engine.sessionId };
+  });
+
+  ipcMain.handle("goal:handle", (_event, sessionId: string, text: string) => {
+    if (!store.getSession(sessionId)) {
+      store.createSession({ id: sessionId, title: text.slice(0, 80), cwd: engine.cwd });
+    }
+    store.appendMessage({
+      sessionId,
+      role: "user",
+      content: JSON.stringify({ type: "text", text }),
+      metadata: { localCommand: "goal" },
+    });
+    const response = executeGoalCommand(paths, sessionId, text);
+    store.appendMessage({
+      sessionId,
+      role: "assistant",
+      content: JSON.stringify([{ type: "text", text: response }]),
+      metadata: { localCommand: "goal" },
+    });
+    return response;
   });
 
   // ── Config ──

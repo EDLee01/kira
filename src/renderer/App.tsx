@@ -6,6 +6,7 @@ declare global {
     desktopAPI: {
       sendMessage: (sessionId: string, text: string) => Promise<void>;
       cancelQuery: () => Promise<void>;
+      handleGoal: (sessionId: string, text: string) => Promise<string>;
       createSession: (title?: string) => Promise<string>;
       listSessions: () => Promise<Array<{ id: string; title: string | null; createdAt: string }>>;
       deleteSession: (id: string) => Promise<void>;
@@ -47,6 +48,12 @@ interface Session {
 
 let mid = 0;
 const uid = () => `m_${++mid}`;
+const DEFAULT_SESSION_TITLE = "Kira";
+
+function displaySessionTitle(title: string | null | undefined, fallback = "Untitled"): string {
+  if (!title) return fallback;
+  return title.trim() === "Magi" ? DEFAULT_SESSION_TITLE : title;
+}
 
 /** Extract display text from a parsed message content field */
 function contentToText(content: any): string {
@@ -226,7 +233,7 @@ export default function App() {
   const newSession = useCallback(async () => {
     if (running) return;
     setShowHistory(false);
-    const newId = await window.desktopAPI.createSession("Magi");
+    const newId = await window.desktopAPI.createSession(DEFAULT_SESSION_TITLE);
     setSid(newId);
     setMsgs([]);
     streamText.current = "";
@@ -239,7 +246,7 @@ export default function App() {
     await window.desktopAPI.deleteSession(id);
     loadSessions();
     if (id === sid) {
-      const newId = await window.desktopAPI.createSession("Magi");
+      const newId = await window.desktopAPI.createSession(DEFAULT_SESSION_TITLE);
       setSid(newId);
       setMsgs([]);
       streamText.current = "";
@@ -266,15 +273,30 @@ export default function App() {
     setInput("");
     inputRef.current!.style.height = "auto";
     setMsgs((p) => [...p, { id: uid(), role: "user", text }]);
-    setRunning(true);
     streamText.current = "";
     let id = sid;
     if (!id) {
       id = await window.desktopAPI.createSession("Kira");
       setSid(id);
     }
+    if (/^\/goal(?:\s|$)/.test(text)) {
+      try {
+        const response = await window.desktopAPI.handleGoal(id, text);
+        setMsgs((p) => [...p, { id: uid(), role: "assistant", text: response }]);
+        loadSessions();
+      } catch (error) {
+        setMsgs((p) => [...p, {
+          id: uid(),
+          role: "system",
+          text: error instanceof Error ? error.message : String(error),
+          isError: true
+        }]);
+      }
+      return;
+    }
+    setRunning(true);
     await window.desktopAPI.sendMessage(id, text);
-  }, [input, running, sid]);
+  }, [input, running, sid, loadSessions]);
 
   const handleKey = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -289,7 +311,7 @@ export default function App() {
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + "px";
   }, []);
 
-  const currentTitle = sessions.find((s) => s.id === sid)?.title ?? "Kira";
+  const currentTitle = displaySessionTitle(sessions.find((s) => s.id === sid)?.title, DEFAULT_SESSION_TITLE);
 
   return (
     <div className="app">
@@ -347,7 +369,7 @@ export default function App() {
                     <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.3"/>
                     <path d="M4 7l2 2 4-4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
                   </svg>
-                  <span className="history-item-title">{s.title ?? "Untitled"}</span>
+                  <span className="history-item-title">{displaySessionTitle(s.title)}</span>
                   <button className="history-del" onClick={(e) => deleteSession(e, s.id)} title="Delete">
                     <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
                       <line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
@@ -482,6 +504,7 @@ export default function App() {
           </div>
         </div>
         <p className="input-hint">Enter 发送 · Shift+Enter 换行</p>
+        <p className="ai-disclaimer">Kira 可能会犯错，请核查重要信息；允许电脑操作前请确认。</p>
       </div>
       </>
       )}

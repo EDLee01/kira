@@ -2,7 +2,16 @@ import { ProviderConfig } from "../config.ts";
 import { MagiConfigError } from "../errors.ts";
 import { providerErrorFromResponse } from "./errors.ts";
 import { FetchLike, getApiKey, normalizeBaseUrl } from "./http.ts";
-import { MagiMessage, MagiToolUsePart, ProviderAdapter, ProviderRequest, ProviderResponse, ProviderStreamEvent, messageText } from "./ir.ts";
+import {
+  MagiContentPart,
+  MagiMessage,
+  MagiToolUsePart,
+  ProviderAdapter,
+  ProviderRequest,
+  ProviderResponse,
+  ProviderStreamEvent,
+  messageText
+} from "./ir.ts";
 import { readSseEvents } from "./sse.ts";
 
 export class MessagesCompatibleAdapter implements ProviderAdapter {
@@ -376,13 +385,7 @@ function toAnthropicMessage(message: MagiMessage): Record<string, unknown> {
   if (message.role === "tool") {
     return {
       role: "user",
-      content: message.content.map((part) => ({
-        type: "tool_result",
-        tool_use_id: part.type === "tool-result" ? part.toolCallId : "unknown",
-        content: part.type === "tool-result" ? part.content : messageText(message),
-        is_error: part.type === "tool-result" ? part.isError : undefined,
-        retryable: part.type === "tool-result" ? part.retryable : undefined
-      }))
+      content: toolResultBlocksForAnthropic(message)
     };
   }
   // user role: support text + image parts
@@ -409,6 +412,41 @@ function toAnthropicMessage(message: MagiMessage): Record<string, unknown> {
     }
   }
   return { role: "user", content: parts };
+}
+
+function toolResultBlocksForAnthropic(message: MagiMessage): Record<string, unknown>[] {
+  const first = message.content.find((part) => part.type === "tool-result");
+  const toolCallId = first?.type === "tool-result" ? first.toolCallId : "unknown";
+  const isError = first?.type === "tool-result" ? first.isError : undefined;
+  const retryable = first?.type === "tool-result" ? first.retryable : undefined;
+  return [{
+    type: "tool_result",
+    tool_use_id: toolCallId,
+    content: contentBlocksForAnthropic(message.content),
+    is_error: isError,
+    retryable
+  }];
+}
+
+function contentBlocksForAnthropic(parts: MagiContentPart[]): Record<string, unknown>[] {
+  const blocks: Record<string, unknown>[] = [];
+  for (const part of parts) {
+    if (part.type === "tool-result" && part.content.trim()) {
+      blocks.push({ type: "text", text: part.content });
+    } else if (part.type === "text" && part.text.trim()) {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: part.mimeType,
+          data: part.data
+        }
+      });
+    }
+  }
+  return blocks.length > 0 ? blocks : [{ type: "text", text: messageText({ role: "tool", content: parts }) }];
 }
 
 function readOpenAiToolUses(value: unknown): MagiToolUsePart[] {

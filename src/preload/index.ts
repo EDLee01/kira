@@ -12,6 +12,7 @@ const api = {
   sendMessage: (sessionId: string, text: string) => ipcRenderer.invoke("engine:query", sessionId, text),
   cancelQuery: () => ipcRenderer.invoke("engine:cancel"),
   getEngineStatus: () => ipcRenderer.invoke("engine:status"),
+  handleGoal: (sessionId: string, text: string) => ipcRenderer.invoke("goal:handle", sessionId, text),
 
   // Workspace
   getWorkspace: () => ipcRenderer.invoke("workspace:get"),

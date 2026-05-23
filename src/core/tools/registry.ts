@@ -64,6 +64,12 @@ import { DateInputSchema, executeDate, formatDateResult, parseDateInput } from "
 import { sshExec } from "../ssh/exec.ts";
 import { sshFileRead, sshFileWrite } from "../ssh/file.ts";
 import { executeSnip, formatSnipResult, parseSnipInput, SnipInputSchema } from "./snip.ts";
+import {
+  ComputerUseInputSchema,
+  executeComputerUse,
+  formatComputerUseResult,
+  parseComputerUseInput
+} from "./computer-use.ts";
 import { executeSkillTool, parseSkillToolInput, SkillToolInputSchema } from "./skill-tool.ts";
 import { writeMemdirEntry, MemdirType } from "../memdir.ts";
 import { formatTodoWriteResult, parseTodoWriteInput, replaceTodoList, TodoWriteInputSchema } from "./todo.ts";
@@ -421,6 +427,9 @@ export function formatToolResult(input: {
   maxChars?: number;
   previewChars?: number;
 }): string {
+  if (input.content.includes("<<MAGI_IMAGE:")) {
+    return input.content;
+  }
   const maxChars = input.maxChars ?? 30_000;
   if (input.content.length <= maxChars) {
     return input.content;
@@ -1469,6 +1478,27 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     isReadOnly: () => true,
     isDestructive: () => false,
     isConcurrencySafe: () => true
+  },
+  {
+    name: "ComputerUse",
+    description: "Observe and control the macOS desktop. Actions: screenshot, click, double_click, right_click, move, drag, type, key, hotkey. Use screenshot first to inspect the screen. Mouse and keyboard actions require explicit user approval.",
+    category: "system",
+    tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos"],
+    inputSchema: ComputerUseInputSchema,
+    call: async (input, context) => {
+      const parsed = parseComputerUseInput(input);
+      const result = await executeComputerUse(parsed, { cwd: context.cwd });
+      return formatComputerUseResult(result);
+    },
+    isReadOnly: (input) => input.action === "screenshot",
+    isDestructive: () => false,
+    isConcurrencySafe: (input) => input.action === "screenshot",
+    checkPermissions: (input) => {
+      if (input.action === "screenshot") {
+        return undefined;
+      }
+      return { decision: "ask", reason: `ComputerUse ${String(input.action)} controls the real desktop` };
+    }
   },
   {
     name: "SshExec",

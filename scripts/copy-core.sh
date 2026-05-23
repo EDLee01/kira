@@ -106,6 +106,7 @@ declare -a FILES=(
   "$SRC/errors.ts"
   "$SRC/paths.ts"
   "$SRC/session-store.ts"
+  "$SRC/goal.ts"
   "$SRC/memory.ts"
   "$SRC/memdir.ts"
   "$SRC/fs-utils.ts"

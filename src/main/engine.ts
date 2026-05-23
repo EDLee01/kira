@@ -2,15 +2,16 @@
  * Engine wrapper — bridges magi-next's runAgentQuery to Electron IPC.
  * Runs in the main process.
  */
-import { BrowserWindow } from "electron";
+import { BrowserWindow, dialog } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
-import { ProviderAdapter } from "../core/providers/ir.ts";
+import { ProviderAdapter, textMessage } from "../core/providers/ir.ts";
 import { loadConfig, MagiConfig, McpServerConfig } from "../core/config.ts";
 import { getMagiPaths, MagiPaths } from "../core/paths.ts";
 import { MessagesCompatibleAdapter } from "../core/providers/messages-compatible.ts";
 import { buildProviderRegistry } from "../core/providers/registry.ts";
 import { SessionStore } from "../core/session-store.ts";
 import { compactSession, recoverSessionContext } from "../core/context/compaction.ts";
+import { formatGoalContext, getGoal } from "../core/goal.ts";
 
 export class Engine {
   private abortController: AbortController | null = null;
@@ -95,6 +96,10 @@ export class Engine {
 
       // Build messages: prepend summary if exists, then recent messages
       const messages: any[] = [];
+      const goalContext = formatGoalContext(getGoal(paths, sessionId));
+      if (goalContext) {
+        messages.push(textMessage("system", goalContext));
+      }
       if (recovered.summary) {
         messages.push({
           role: "user",
@@ -145,9 +150,36 @@ export class Engine {
         sessionId,
         signal: this.abortController.signal,
         permissionMode: "auto",
+        approvalResolver: async ({ toolUse, reason }) => {
+          if (toolUse.name !== "ComputerUse") {
+            return false;
+          }
+          const detail = [
+            reason,
+            "",
+            `Action: ${String(toolUse.input.action ?? "")}`,
+            toolUse.input.x !== undefined || toolUse.input.y !== undefined ? `Coordinates: (${toolUse.input.x ?? "?"}, ${toolUse.input.y ?? "?"})` : undefined,
+            toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
+            Array.isArray(toolUse.input.keys) ? `Keys: ${toolUse.input.keys.join("+")}` : undefined,
+            toolUse.input.key !== undefined ? `Key: ${String(toolUse.input.key)}` : undefined
+          ].filter((line): line is string => Boolean(line)).join("\n");
+          const result = await dialog.showMessageBox(this.win, {
+            type: "warning",
+            buttons: ["Allow", "Deny"],
+            defaultId: 1,
+            cancelId: 1,
+            title: "Allow Kira to control the computer?",
+            message: "Kira wants to perform a desktop action.",
+            detail
+          });
+          return result.response === 0;
+        },
         mcp: mcpConfig,
         onStreamEvent: (ev) => {
-          this.emit("engine:stream-event", ev);
+          const visibleEvent = ev.type === "tool_result"
+            ? { ...ev, content: hideEncodedImages(ev.content) }
+            : ev;
+          this.emit("engine:stream-event", visibleEvent);
           if (ev.type === "text_delta" && ev.text) {
             assistantText += ev.text;
           }
@@ -220,6 +252,10 @@ export class Engine {
       fetchImpl: retryingFetch,
     });
   }
+}
+
+function hideEncodedImages(content: string): string {
+  return content.replace(/<<MAGI_IMAGE:[\s\S]*?:MAGI_IMAGE>>/g, "[Screenshot provided to the vision model]");
 }
 
 /**
