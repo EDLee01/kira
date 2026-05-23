@@ -689,6 +689,14 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+.settings-note {
+  color: var(--fg3) !important;
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  line-height: 1.35;
+}
 .settings-input {
   padding: 10px 12px;
   background: var(--bg);

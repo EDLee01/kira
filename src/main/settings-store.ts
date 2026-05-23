@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { MagiPaths } from "../core/paths.ts";
+import { DesktopProviderKind, providerDefaults } from "./model-discovery";
 
 export type DesktopSettings = Record<string, string>;
 
@@ -23,7 +24,13 @@ export function writeDesktopSettings(paths: MagiPaths, settings: DesktopSettings
 }
 
 export function applyDesktopSettingsToEnv(settings: DesktopSettings): void {
-  if (settings.apiKey) process.env["ANTHROPIC_AUTH_TOKEN"] = settings.apiKey;
-  if (settings.baseUrl) process.env["ANTHROPIC_BASE_URL"] = settings.baseUrl;
-  if (settings.model) process.env["ANTHROPIC_MODEL"] = settings.model;
+  const provider = readProvider(settings.provider);
+  const defaults = providerDefaults(provider);
+  if (settings.apiKey) process.env[defaults.apiKeyEnv] = settings.apiKey;
+  if (settings.baseUrl) process.env[defaults.baseUrlEnv] = settings.baseUrl;
+  if (settings.model) process.env[defaults.modelEnv] = settings.model;
+}
+
+function readProvider(value: string | undefined): DesktopProviderKind {
+  return value === "openai" || value === "openai-compatible" ? value : "anthropic";
 }

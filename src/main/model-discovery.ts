@@ -19,6 +19,9 @@ export interface AutoModelRoutes {
   long: string;
 }
 
+export type DesktopProviderKind = "anthropic" | "openai" | "openai-compatible";
+export type OpenAiDesktopEndpoint = "chat" | "responses";
+
 export interface ModelDiscoveryResult {
   ok: boolean;
   message: string;
@@ -28,18 +31,28 @@ export interface ModelDiscoveryResult {
 }
 
 export interface ModelSettings {
+  provider?: string;
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  openAiEndpoint?: string;
   discoveredModels?: string;
   autoRoutes?: string;
   modelsUpdatedAt?: string;
 }
 
-const FALLBACK_MODEL_IDS = [
+const FALLBACK_MODEL_IDS: Record<DesktopProviderKind, string[]> = {
+  anthropic: [
   "claude-haiku-4-5",
   "claude-sonnet-4-6",
   "claude-opus-4-7",
+  ],
+  openai: [
+  "gpt-4.1-mini",
+  "gpt-4.1",
+  "gpt-4o",
+  ],
+  "openai-compatible": [
   "gemini-2.5-flash",
   "gemini-2.5-pro",
   "gpt-4.1-mini",
@@ -47,19 +60,61 @@ const FALLBACK_MODEL_IDS = [
   "gpt-4o",
   "deepseek-chat",
   "deepseek-reasoner",
-];
+  ],
+};
+
+export function providerDefaults(provider: DesktopProviderKind): {
+  baseUrl: string;
+  apiKeyEnv: string;
+  baseUrlEnv: string;
+  modelEnv: string;
+  defaultModel: string;
+} {
+  switch (provider) {
+    case "openai":
+      return {
+        baseUrl: "https://api.openai.com/v1",
+        apiKeyEnv: "OPENAI_API_KEY",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        modelEnv: "OPENAI_MODEL",
+        defaultModel: "gpt-4.1-mini",
+      };
+    case "openai-compatible":
+      return {
+        baseUrl: "https://api.openai.com/v1",
+        apiKeyEnv: "OPENAI_API_KEY",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        modelEnv: "OPENAI_MODEL",
+        defaultModel: "gpt-4.1-mini",
+      };
+    case "anthropic":
+    default:
+      return {
+        baseUrl: "https://api.anthropic.com",
+        apiKeyEnv: "ANTHROPIC_AUTH_TOKEN",
+        baseUrlEnv: "ANTHROPIC_BASE_URL",
+        modelEnv: "ANTHROPIC_MODEL",
+        defaultModel: "claude-haiku-4-5",
+      };
+  }
+}
 
 export function defaultModelDiscovery(): ModelDiscoveryResult {
+  return defaultModelDiscoveryForProvider("anthropic");
+}
+
+export function defaultModelDiscoveryForProvider(provider: DesktopProviderKind): ModelDiscoveryResult {
   return buildModelDiscoveryResult({
     ok: true,
     message: "Using default model list",
-    ids: FALLBACK_MODEL_IDS,
+    ids: FALLBACK_MODEL_IDS[provider],
     source: "fallback",
   });
 }
 
 export function modelDiscoveryFromSettings(settings: ModelSettings): ModelDiscoveryResult {
-  const fallback = defaultModelDiscovery();
+  const provider = readProvider(settings.provider);
+  const fallback = defaultModelDiscoveryForProvider(provider);
   const parsedModels = parseJsonArray(settings.discoveredModels);
   const models = parsedModels.length > 0
     ? normalizeModelIds(parsedModels).map((id) => toDiscoveredModel(id, "discovered"))
@@ -75,7 +130,9 @@ export function modelDiscoveryFromSettings(settings: ModelSettings): ModelDiscov
 }
 
 export function resolveModelForDesktop(settings: ModelSettings): string {
-  const selected = settings.model || process.env["ANTHROPIC_MODEL"] || "claude-haiku-4-5";
+  const provider = readProvider(settings.provider);
+  const defaults = providerDefaults(provider);
+  const selected = settings.model || process.env[defaults.modelEnv] || defaults.defaultModel;
   if (selected !== "auto") return selected;
   return modelDiscoveryFromSettings(settings).auto.main;
 }
@@ -85,12 +142,24 @@ export function normalizeAnthropicBaseUrl(baseUrl: string): string {
   return normalized.endsWith("/v1") ? normalized.slice(0, -3) : normalized;
 }
 
+export function normalizeProviderBaseUrl(provider: DesktopProviderKind, baseUrl: string): string {
+  if (provider === "anthropic") return normalizeAnthropicBaseUrl(baseUrl);
+  return normalizeOpenAiBaseUrl(baseUrl);
+}
+
+export function normalizeOpenAiBaseUrl(baseUrl: string): string {
+  const normalized = normalizeBaseUrl(baseUrl);
+  return normalized.endsWith("/v1") ? normalized : `${normalized}/v1`;
+}
+
 export async function discoverModels(settings: ModelSettings, fetchImpl: typeof fetch = fetch): Promise<ModelDiscoveryResult> {
-  const baseUrl = normalizeBaseUrl(settings.baseUrl || "https://api.anthropic.com");
+  const provider = readProvider(settings.provider);
+  const defaults = providerDefaults(provider);
+  const baseUrl = normalizeProviderBaseUrl(provider, settings.baseUrl || defaults.baseUrl);
   const apiKey = settings.apiKey || "";
   if (!apiKey.trim()) {
     return {
-      ...defaultModelDiscovery(),
+      ...defaultModelDiscoveryForProvider(provider),
       ok: false,
       message: "API Key is required to discover models",
     };
@@ -102,11 +171,7 @@ export async function discoverModels(settings: ModelSettings, fetchImpl: typeof 
     try {
       const res = await fetchImpl(url, {
         method: "GET",
-        headers: {
-          "x-api-key": apiKey,
-          "Authorization": `Bearer ${apiKey}`,
-          "anthropic-version": "2023-06-01",
-        },
+        headers: modelListHeaders(provider, apiKey),
       });
       const body = await res.text();
       if (!res.ok) {
@@ -129,7 +194,7 @@ export async function discoverModels(settings: ModelSettings, fetchImpl: typeof 
     }
   }
 
-  const fallback = defaultModelDiscovery();
+  const fallback = defaultModelDiscoveryForProvider(provider);
   return {
     ...fallback,
     ok: false,
@@ -138,6 +203,8 @@ export async function discoverModels(settings: ModelSettings, fetchImpl: typeof 
 }
 
 export async function testModelConnection(settings: ModelSettings, fetchImpl: typeof fetch = fetch): Promise<{ ok: boolean; message: string; discovery: ModelDiscoveryResult }> {
+  const provider = readProvider(settings.provider);
+  const defaults = providerDefaults(provider);
   const discoveryResult = await discoverModels(settings, fetchImpl);
   const discovery = discoveryResult.ok
     ? discoveryResult
@@ -147,23 +214,13 @@ export async function testModelConnection(settings: ModelSettings, fetchImpl: ty
         message: discoveryResult.message,
       };
   const model = settings.model === "auto" ? discovery.auto.main : (settings.model || discovery.auto.main);
-  const baseUrl = normalizeAnthropicBaseUrl(settings.baseUrl || "https://api.anthropic.com");
+  const baseUrl = normalizeProviderBaseUrl(provider, settings.baseUrl || defaults.baseUrl);
   const apiKey = settings.apiKey || "";
 
   try {
-    const res = await fetchImpl(`${baseUrl}/v1/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 10,
-        messages: [{ role: "user", content: "hi" }],
-      }),
-    });
+    const res = provider === "anthropic"
+      ? await testAnthropicConnection(fetchImpl, baseUrl, apiKey, model)
+      : await testOpenAiConnection(fetchImpl, baseUrl, apiKey, model, settings.openAiEndpoint);
     if (res.ok) {
       return {
         ok: true,
@@ -265,7 +322,7 @@ function toDiscoveredModel(id: string, source: "discovered" | "fallback"): Disco
 function inferCapabilities(modelId: string): ModelCapabilities {
   const id = modelId.toLowerCase();
   const role: ModelCapabilities["role"] =
-    id.includes("opus") || id.includes("o3") || id.includes("o4") || id.includes("reasoner") || id.includes("reasoning")
+    id.includes("opus") || id.includes("o3") || id.includes("o4") || id.includes("o1") || id.includes("reasoner") || id.includes("reasoning")
       ? "deep"
       : id.includes("haiku") || id.includes("mini") || id.includes("flash") || id.includes("lite") || id.includes("small")
         ? "fast"
@@ -278,6 +335,7 @@ function inferCapabilities(modelId: string): ModelCapabilities {
     id.includes("opus") ||
     id.includes("gpt-4o") ||
     id.includes("gpt-4.1") ||
+    id.includes("gpt-5") ||
     id.includes("vision") ||
     id.includes("gemini");
 
@@ -286,7 +344,9 @@ function inferCapabilities(modelId: string): ModelCapabilities {
     id.includes("1m") ||
     id.includes("long") ||
     id.includes("claude") ||
-    id.includes("gemini");
+    id.includes("gemini") ||
+    id.includes("gpt-4.1") ||
+    id.includes("gpt-5");
 
   return { role, vision, longContext };
 }
@@ -355,4 +415,66 @@ function normalizeBaseUrl(baseUrl: string): string {
 function buildModelListUrls(baseUrl: string): string[] {
   if (baseUrl.endsWith("/v1")) return [`${baseUrl}/models`];
   return [`${baseUrl}/v1/models`, `${baseUrl}/models`];
+}
+
+function readProvider(value: string | undefined): DesktopProviderKind {
+  return value === "openai" || value === "openai-compatible" ? value : "anthropic";
+}
+
+function modelListHeaders(provider: DesktopProviderKind, apiKey: string): Record<string, string> {
+  if (provider === "anthropic") {
+    return {
+      "x-api-key": apiKey,
+      "Authorization": `Bearer ${apiKey}`,
+      "anthropic-version": "2023-06-01",
+    };
+  }
+  return {
+    "Authorization": `Bearer ${apiKey}`,
+  };
+}
+
+async function testAnthropicConnection(fetchImpl: typeof fetch, baseUrl: string, apiKey: string, model: string): Promise<Response> {
+  return fetchImpl(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  });
+}
+
+async function testOpenAiConnection(fetchImpl: typeof fetch, baseUrl: string, apiKey: string, model: string, endpoint?: string): Promise<Response> {
+  if (endpoint === "responses") {
+    return fetchImpl(`${baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        input: "hi",
+        max_output_tokens: 10,
+      }),
+    });
+  }
+  return fetchImpl(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 10,
+    }),
+  });
 }

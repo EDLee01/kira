@@ -4,9 +4,7 @@ import { registerIPC, unregisterIPC } from "./ipc";
 import { startScheduler } from "./scheduler";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
-import { MessagesCompatibleAdapter } from "../core/providers/messages-compatible.ts";
-import { readDesktopSettings } from "./settings-store";
-import { normalizeAnthropicBaseUrl, resolveModelForDesktop } from "./model-discovery";
+import { buildDesktopProvider } from "./desktop-provider";
 
 let mainWindow: BrowserWindow | null = null;
 let stopScheduler: (() => void) | null = null;
@@ -36,25 +34,7 @@ function createWindow(): void {
     store,
     paths,
     win: mainWindow,
-    getAdapter: () => {
-      const settings = readDesktopSettings(paths);
-      const apiKey = settings.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"];
-      const baseUrl = normalizeAnthropicBaseUrl(settings.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com");
-      const model = resolveModelForDesktop(settings);
-      return new MessagesCompatibleAdapter({
-        name: "anthropic",
-        config: { type: "messages-compatible", format: "anthropic-messages", baseUrl, apiKeyEnv: "ANTHROPIC_AUTH_TOKEN", defaultModel: model },
-        env: {
-          ...process.env,
-          ANTHROPIC_AUTH_TOKEN: apiKey || "",
-          ANTHROPIC_BASE_URL: baseUrl,
-          ANTHROPIC_MODEL: model,
-        },
-      });
-    },
-    getModel: () => {
-      return resolveModelForDesktop(readDesktopSettings(paths));
-    },
+    getProvider: () => buildDesktopProvider(paths),
   });
 
   if (process.env.NODE_ENV === "development") {

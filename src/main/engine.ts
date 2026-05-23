@@ -4,19 +4,17 @@
  */
 import { BrowserWindow, dialog } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
-import { ProviderAdapter, textMessage } from "../core/providers/ir.ts";
-import { loadConfig, MagiConfig, McpServerConfig } from "../core/config.ts";
+import { textMessage } from "../core/providers/ir.ts";
+import { McpServerConfig } from "../core/config.ts";
 import { getMagiPaths, MagiPaths } from "../core/paths.ts";
-import { MessagesCompatibleAdapter } from "../core/providers/messages-compatible.ts";
-import { buildProviderRegistry } from "../core/providers/registry.ts";
 import { SessionStore } from "../core/session-store.ts";
 import { compactSession, recoverSessionContext } from "../core/context/compaction.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
-import { readDesktopSettings } from "./settings-store";
-import { normalizeAnthropicBaseUrl, resolveModelForDesktop } from "./model-discovery";
+import { buildDesktopProvider } from "./desktop-provider";
 
 export class Engine {
   private abortController: AbortController | null = null;
+  private queryTimeout: NodeJS.Timeout | null = null;
   private _running = false;
   private _sessionId: string | null = null;
   private _cwd: string = process.cwd();
@@ -52,16 +50,20 @@ export class Engine {
   async startQuery(sessionId: string, userMessage: string): Promise<void> {
     if (this._running) {
       this.emit("engine:error", { error: "A query is already running" });
-      return;
+      throw new Error("A query is already running");
     }
 
     this._running = true;
     this._sessionId = sessionId;
     this.abortController = new AbortController();
+    this.queryTimeout = setTimeout(() => {
+      this.abortController?.abort(new Error("Query timed out after 45 seconds"));
+    }, 45_000);
 
     try {
       const paths = getMagiPaths(process.env);
-      const adapter = this.buildProvider(paths);
+      const runtime = this.buildProvider(paths);
+      const { adapter, model, providerName, env } = runtime;
 
       // Load session messages from DB (user message already appended by ipc.ts)
       const session = this.store.getSession(sessionId);
@@ -125,8 +127,6 @@ export class Engine {
         messages.push({ role: m.role, content });
       }
 
-      const model = resolveModelForDesktop(readDesktopSettings(paths));
-
       this.emit("engine:status", { running: true, sessionId });
 
       // Accumulate assistant text for persistence
@@ -140,10 +140,10 @@ export class Engine {
       for await (const event of runAgentQuery({
         adapter,
         model,
-        providerName: "anthropic",
+        providerName,
         messages,
         cwd: this._cwd,
-        env: process.env,
+        env,
         stateRoot: paths.stateRoot,
         sessionId,
         signal: this.abortController.signal,
@@ -205,6 +205,10 @@ export class Engine {
         });
       }
     } finally {
+      if (this.queryTimeout) {
+        clearTimeout(this.queryTimeout);
+        this.queryTimeout = null;
+      }
       this._running = false;
       this._sessionId = null;
       this.abortController = null;
@@ -213,77 +217,46 @@ export class Engine {
   }
 
   cancelQuery(): void {
+    if (this.queryTimeout) {
+      clearTimeout(this.queryTimeout);
+      this.queryTimeout = null;
+    }
     this.abortController?.abort();
     this.abortController = null;
   }
 
-  private buildProvider(paths: MagiPaths): ProviderAdapter {
-    let config: MagiConfig | null = null;
-    try {
-      config = loadConfig(paths, process.env);
-    } catch {}
+  canStartQuery(): boolean {
+    return !this._running;
+  }
 
-    if (config && config.providers && Object.keys(config.providers).length > 0) {
-      const registry = buildProviderRegistry({ config, env: process.env });
-      const first = registry.values().next().value;
-      if (first) return first;
+  appendUserMessage(sessionId: string, text: string): void {
+    if (!this.store.getSession(sessionId)) {
+      this.store.createSession({ id: sessionId, title: text.slice(0, 80), cwd: this._cwd });
     }
-
-    const settings = readDesktopSettings(paths);
-    const apiKey = settings.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"];
-    const baseUrl = normalizeAnthropicBaseUrl(settings.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com");
-    const model = resolveModelForDesktop(settings);
-
-    if (!apiKey) {
-      throw new Error("No API key. Set ANTHROPIC_AUTH_TOKEN in your environment.");
-    }
-
-    const env = {
-      ...process.env,
-      ANTHROPIC_AUTH_TOKEN: apiKey,
-      ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_MODEL: model,
-    };
-
-    return new MessagesCompatibleAdapter({
-      name: "anthropic",
-      config: {
-        type: "messages-compatible",
-        format: "anthropic-messages",
-        baseUrl,
-        apiKeyEnv: "ANTHROPIC_AUTH_TOKEN",
-        defaultModel: model,
-      },
-      env,
-      fetchImpl: retryingFetch,
+    this.store.appendMessage({
+      sessionId,
+      role: "user",
+      content: JSON.stringify({ type: "text", text }),
+      metadata: {},
     });
   }
+
+  private buildProvider(paths: MagiPaths): ReturnType<typeof buildDesktopProvider> {
+    const runtime = buildDesktopProvider(paths);
+    if (!hasRuntimeApiKey(runtime)) {
+      throw new Error("No API key. Set an API key in Settings.");
+    }
+    return runtime;
+  }
+}
+
+function hasRuntimeApiKey(runtime: ReturnType<typeof buildDesktopProvider>): boolean {
+  if (runtime.providerName === "anthropic") {
+    return Boolean(runtime.env.ANTHROPIC_AUTH_TOKEN);
+  }
+  return Boolean(runtime.env.OPENAI_API_KEY);
 }
 
 function hideEncodedImages(content: string): string {
   return content.replace(/<<MAGI_IMAGE:[\s\S]*?:MAGI_IMAGE>>/g, "[Screenshot provided to the vision model]");
-}
-
-/**
- * Wrap fetch with retry on transient network errors.
- * Retries up to 3 times with exponential backoff for "fetch failed" / connection errors.
- */
-async function retryingFetch(input: any, init?: any): Promise<Response> {
-  const maxAttempts = 3;
-  let lastError: any;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      return await fetch(input, init);
-    } catch (err: any) {
-      lastError = err;
-      // Don't retry on abort
-      if (err?.name === "AbortError" || init?.signal?.aborted) throw err;
-      const msg = String(err?.message || "");
-      const isNetworkError = msg.includes("fetch failed") || msg.includes("ENOTFOUND") || msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT") || msg.includes("ECONNREFUSED");
-      if (!isNetworkError || attempt === maxAttempts - 1) throw err;
-      // Exponential backoff: 1s, 2s, 4s
-      await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
-    }
-  }
-  throw lastError;
 }

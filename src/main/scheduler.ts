@@ -14,13 +14,17 @@ const POLL_INTERVAL_MS = 30_000;
 export interface SchedulerDeps {
   store: SessionStore;
   paths: MagiPaths;
-  getAdapter: () => ProviderAdapter;
-  getModel: () => string;
+  getProvider: () => {
+    adapter: ProviderAdapter;
+    providerName: string;
+    model: string;
+    env: NodeJS.ProcessEnv;
+  };
   win: BrowserWindow;
 }
 
 export function startScheduler(deps: SchedulerDeps): () => void {
-  const { store, paths, getAdapter, getModel, win } = deps;
+  const { store, paths, getProvider, win } = deps;
   const cronPath = cronStorePathFromRoot(paths.stateRoot);
   let running = false;
 
@@ -58,17 +62,16 @@ export function startScheduler(deps: SchedulerDeps): () => void {
 
     let resultText = "";
     try {
-      const adapter = getAdapter();
-      const model = getModel();
+      const provider = getProvider();
       const messages = [{ role: "user" as const, content: [{ type: "text" as const, text: item.prompt }] }];
 
       for await (const event of runAgentQuery({
-        adapter,
-        model,
-        providerName: "anthropic",
+        adapter: provider.adapter,
+        model: provider.model,
+        providerName: provider.providerName,
         messages,
         cwd: process.cwd(),
-        env: process.env,
+        env: provider.env,
         permissionMode: "auto",
       })) {
         if (event.type === "text_delta" && event.text) {

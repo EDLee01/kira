@@ -11,8 +11,11 @@ import { applyDesktopSettingsToEnv, readDesktopSettings, writeDesktopSettings } 
 import {
   discoverModels,
   modelDiscoveryFromSettings,
+  normalizeProviderBaseUrl,
+  providerDefaults,
   serializeModelDiscovery,
   testModelConnection,
+  type DesktopProviderKind,
 } from "./model-discovery";
 import QRCode from "qrcode";
 import * as os from "os";
@@ -28,7 +31,7 @@ export function registerIPC(win: BrowserWindow): void {
   const writeSettings = (settings: Record<string, string>) => writeDesktopSettings(paths, settings);
   const normalizeIncomingSettings = (settings: Record<string, unknown>): Record<string, string> => {
     const normalized: Record<string, string> = {};
-    for (const key of ["baseUrl", "apiKey", "model", "theme", "workspace"]) {
+    for (const key of ["provider", "baseUrl", "apiKey", "model", "openAiEndpoint", "theme", "workspace"]) {
       const value = settings[key];
       if (typeof value === "string") normalized[key] = value;
     }
@@ -71,16 +74,10 @@ export function registerIPC(win: BrowserWindow): void {
   // ── Engine ──
 
   ipcMain.handle("engine:query", async (_event, sessionId: string, text: string) => {
-    // Ensure the user message is saved to the session
-    if (!store.getSession(sessionId)) {
-      store.createSession({ id: sessionId, title: text.slice(0, 80), cwd: engine.cwd });
+    if (!engine.canStartQuery()) {
+      throw new Error("Kira is still working on the previous message. Wait for it to finish or cancel it.");
     }
-    store.appendMessage({
-      sessionId,
-      role: "user",
-      content: JSON.stringify({ type: "text", text }),
-      metadata: {},
-    });
+    engine.appendUserMessage(sessionId, text);
     await engine.startQuery(sessionId, text);
   });
 
@@ -196,11 +193,15 @@ export function registerIPC(win: BrowserWindow): void {
 
   ipcMain.handle("settings:get", () => {
     const saved = readSettings();
+    const provider = readProvider(saved.provider);
+    const defaults = providerDefaults(provider);
     const modelDiscovery = modelDiscoveryFromSettings(saved);
     return {
-      baseUrl: saved.baseUrl || process.env["ANTHROPIC_BASE_URL"] || "https://api.anthropic.com",
-      apiKey: saved.apiKey || process.env["ANTHROPIC_AUTH_TOKEN"] || "",
-      model: saved.model || process.env["ANTHROPIC_MODEL"] || "claude-haiku-4-5",
+      provider,
+      baseUrl: normalizeProviderBaseUrl(provider, saved.baseUrl || process.env[defaults.baseUrlEnv] || defaults.baseUrl),
+      apiKey: saved.apiKey || process.env[defaults.apiKeyEnv] || "",
+      model: saved.model || process.env[defaults.modelEnv] || defaults.defaultModel,
+      openAiEndpoint: saved.openAiEndpoint || "chat",
       theme: saved.theme || "dark",
       availableModels: modelDiscovery.models,
       autoRoutes: modelDiscovery.auto,
@@ -210,7 +211,8 @@ export function registerIPC(win: BrowserWindow): void {
 
   ipcMain.handle("settings:set", (_event, settings: Record<string, unknown>) => {
     const current = readSettings();
-    const merged = { ...current, ...normalizeIncomingSettings(settings) };
+    const normalized = normalizeIncomingSettings(settings);
+    const merged = settingsWithProviderReset(current, normalized);
     writeSettings(merged);
     applyDesktopSettingsToEnv(merged);
     return merged;
@@ -219,11 +221,12 @@ export function registerIPC(win: BrowserWindow): void {
   ipcMain.handle("settings:test", async (_event, settings: Record<string, unknown>) => {
     const normalized = normalizeIncomingSettings(settings);
     const current = readSettings();
-    const result = await testModelConnection({ ...current, ...normalized });
+    const mergedForTest = settingsWithProviderReset(current, normalized);
+    const result = await testModelConnection(mergedForTest);
     const discoveryCache = result.discovery.ok
       ? serializeModelDiscovery(result.discovery)
       : {};
-    const merged = { ...current, ...normalized, ...discoveryCache };
+    const merged = { ...mergedForTest, ...discoveryCache };
     writeSettings(merged);
     applyDesktopSettingsToEnv(merged);
     return result;
@@ -232,11 +235,12 @@ export function registerIPC(win: BrowserWindow): void {
   ipcMain.handle("settings:discover-models", async (_event, settings: Record<string, unknown>) => {
     const normalized = normalizeIncomingSettings(settings);
     const current = readSettings();
-    const result = await discoverModels({ ...current, ...normalized });
+    const mergedForDiscovery = settingsWithProviderReset(current, normalized);
+    const result = await discoverModels(mergedForDiscovery);
     const discoveryCache = result.ok
       ? serializeModelDiscovery(result)
       : {};
-    const merged = { ...current, ...normalized, ...discoveryCache };
+    const merged = { ...mergedForDiscovery, ...discoveryCache };
     writeSettings(merged);
     applyDesktopSettingsToEnv(merged);
     return result;
@@ -335,6 +339,26 @@ export function registerIPC(win: BrowserWindow): void {
       nodeVersion: process.version,
     };
   });
+}
+
+function readProvider(value: string | undefined): DesktopProviderKind {
+  return value === "openai" || value === "openai-compatible" ? value : "anthropic";
+}
+
+function settingsWithProviderReset(current: Record<string, string>, incoming: Record<string, string>): Record<string, string> {
+  const currentProvider = readProvider(current.provider);
+  const nextProvider = readProvider(incoming.provider ?? current.provider);
+  const merged = { ...current, ...incoming };
+  if (nextProvider !== currentProvider) {
+    delete merged.discoveredModels;
+    delete merged.autoRoutes;
+    delete merged.modelsUpdatedAt;
+    const defaults = providerDefaults(nextProvider);
+    if (!incoming.baseUrl) merged.baseUrl = defaults.baseUrl;
+    if (!incoming.model || incoming.model === current.model) merged.model = defaults.defaultModel;
+    if (nextProvider !== "anthropic" && !incoming.openAiEndpoint) merged.openAiEndpoint = "chat";
+  }
+  return merged;
 }
 
 export function unregisterIPC(): void {

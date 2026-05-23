@@ -21,9 +21,11 @@ interface AutoModelRoutes {
 }
 
 interface SettingsState {
+  provider?: "anthropic" | "openai" | "openai-compatible";
   baseUrl: string;
   apiKey: string;
   model: string;
+  openAiEndpoint?: "chat" | "responses";
   theme: string;
   availableModels?: DiscoveredModel[];
   autoRoutes?: AutoModelRoutes;
@@ -45,8 +47,8 @@ declare global {
       pickWorkspace: () => Promise<string | null>;
       getSettings: () => Promise<SettingsState>;
       setSettings: (s: SettingsState) => Promise<SettingsState>;
-      testConnection: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string; discovery?: { models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string } }>;
-      discoverModels: (s: { baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; message: string; models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string }>;
+      testConnection: (s: { provider?: string; baseUrl: string; apiKey: string; model: string; openAiEndpoint?: string }) => Promise<{ ok: boolean; message: string; discovery?: { models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string } }>;
+      discoverModels: (s: { provider?: string; baseUrl: string; apiKey: string; model: string; openAiEndpoint?: string }) => Promise<{ ok: boolean; message: string; models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string }>;
       listScheduledTasks: () => Promise<any[]>;
       pauseTask: (id: string) => Promise<any>;
       resumeTask: (id: string) => Promise<any>;
@@ -110,7 +112,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "tasks">("chat");
   const [workspace, setWorkspace] = useState("");
-  const [settings, setSettings] = useState<SettingsState>({ baseUrl: "", apiKey: "", model: "", theme: "dark" });
+  const [settings, setSettings] = useState<SettingsState>({ provider: "anthropic", baseUrl: "", apiKey: "", model: "", openAiEndpoint: "chat", theme: "dark" });
   const streamText = useRef("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -325,7 +327,18 @@ export default function App() {
       return;
     }
     setRunning(true);
-    await window.desktopAPI.sendMessage(id, text);
+    try {
+      await window.desktopAPI.sendMessage(id, text);
+    } catch (error) {
+      setMsgs((p) => [...p, {
+        id: uid(),
+        role: "system",
+        text: error instanceof Error ? error.message : String(error),
+        isError: true
+      }]);
+      setRunning(false);
+      streamText.current = "";
+    }
   }, [input, running, sid, loadSessions]);
 
   const handleKey = useCallback((e: React.KeyboardEvent) => {
@@ -574,13 +587,38 @@ function SettingsPanel({ settings, onSave, onClose }: {
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [remote, setRemote] = useState<{ running: boolean; publicUrl: string | null; accessUrl: string | null; token: string | null; clients: number; qrSvg: string | null }>({ running: false, publicUrl: null, accessUrl: null, token: null, clients: 0, qrSvg: null });
   const [remoteLoading, setRemoteLoading] = useState(false);
+  const provider = form.provider ?? "anthropic";
   const availableModels = form.availableModels ?? [];
   const selectedModelExists = form.model === "auto" || availableModels.some((model) => model.id === form.model);
   const showCustomModelInput = Boolean(form.model && !selectedModelExists);
+  const baseUrlPlaceholder = provider === "anthropic"
+    ? "https://api.anthropic.com"
+    : provider === "openai"
+      ? "https://api.openai.com/v1"
+      : "https://your-provider.example.com/v1";
+  const modelPlaceholder = provider === "anthropic" ? "claude-sonnet-4-6" : "gpt-4.1-mini";
 
   useEffect(() => {
     (window.desktopAPI as any).getRemoteStatus?.().then((s: any) => s && setRemote(s));
   }, []);
+
+  const changeProvider = (nextProvider: SettingsState["provider"]) => {
+    const nextBaseUrl = nextProvider === "anthropic"
+      ? "https://api.anthropic.com"
+      : "https://api.openai.com/v1";
+    const nextModel = nextProvider === "anthropic" ? "claude-haiku-4-5" : "gpt-4.1-mini";
+    setForm({
+      ...form,
+      provider: nextProvider,
+      baseUrl: nextBaseUrl,
+      model: nextModel,
+      openAiEndpoint: nextProvider === "anthropic" ? form.openAiEndpoint : "chat",
+      availableModels: undefined,
+      autoRoutes: undefined,
+      modelsUpdatedAt: undefined,
+    });
+    setTestResult(null);
+  };
 
   const testConn = async () => {
     setTesting(true);
@@ -657,13 +695,29 @@ function SettingsPanel({ settings, onSave, onClose }: {
           </label>
 
           <label className="settings-label">
+            <span>Provider</span>
+            <select
+              className="settings-input settings-select"
+              value={provider}
+              onChange={(e) => changeProvider(e.target.value as SettingsState["provider"])}
+            >
+              <option value="anthropic">Anthropic / Claude</option>
+              <option value="openai">OpenAI</option>
+              <option value="openai-compatible">OpenAI-compatible</option>
+            </select>
+          </label>
+
+          <label className="settings-label">
             <span>API Base URL</span>
             <input
               className="settings-input"
               value={form.baseUrl}
               onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
-              placeholder="https://api.anthropic.com"
+              placeholder={baseUrlPlaceholder}
             />
+            {provider === "openai-compatible" && (
+              <span className="settings-note">Use the third-party provider's OpenAI-compatible /v1 endpoint.</span>
+            )}
           </label>
 
           <label className="settings-label">
@@ -674,13 +728,27 @@ function SettingsPanel({ settings, onSave, onClose }: {
                 type={showKey ? "text" : "password"}
                 value={form.apiKey}
                 onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
-                placeholder="sk-..."
+                placeholder={provider === "anthropic" ? "sk-ant-..." : "sk-..."}
               />
               <button className="settings-eye" onClick={() => setShowKey(!showKey)}>
                 {showKey ? "Hide" : "Show"}
               </button>
             </div>
           </label>
+
+          {provider !== "anthropic" && (
+            <label className="settings-label">
+              <span>OpenAI Endpoint</span>
+              <select
+                className="settings-input settings-select"
+                value={form.openAiEndpoint || "chat"}
+                onChange={(e) => setForm({ ...form, openAiEndpoint: e.target.value as SettingsState["openAiEndpoint"] })}
+              >
+                <option value="chat">Chat Completions</option>
+                <option value="responses">Responses</option>
+              </select>
+            </label>
+          )}
 
           <label className="settings-label">
             <span>Model</span>
@@ -710,7 +778,7 @@ function SettingsPanel({ settings, onSave, onClose }: {
                 className="settings-input"
                 value={form.model}
                 onChange={(e) => setForm({ ...form, model: e.target.value })}
-                placeholder="Enter custom model id"
+                placeholder={modelPlaceholder}
               />
             )}
             {form.model === "auto" && form.autoRoutes && (
