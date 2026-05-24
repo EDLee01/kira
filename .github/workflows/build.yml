@@ -35,7 +35,7 @@ jobs:
 
       - name: Build app (macOS)
         if: matrix.os == 'macos-latest'
-        run: npx electron-builder --mac --publish never
+        run: npx electron-builder --mac --arm64 --x64 --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

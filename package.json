@@ -1,6 +1,6 @@
 {
   "name": "kira",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Kira — AI desktop assistant",
   "main": "dist/main/index.js",
@@ -14,7 +14,7 @@
     "build": "npm run build:main && npm run build:renderer",
     "test:workspace": "esbuild scripts/test-workspace-policy.ts --bundle --platform=node --outfile=dist/test-workspace-policy.cjs --format=cjs --external:electron --external:playwright --external:better-sqlite3 --external:iconv-lite --tsconfig=tsconfig.json && node dist/test-workspace-policy.cjs",
     "dist": "npm run build && electron-builder",
-    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:mac": "npm run build && electron-builder --mac --arm64 --x64",
     "dist:win": "npm run build && electron-builder --win",
     "start": "NODE_ENV=production electron ."
   },

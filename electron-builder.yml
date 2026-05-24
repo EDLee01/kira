@@ -15,7 +15,7 @@ extraResources:
     to: build/icon.ico
 mac:
   target: dmg
-  artifactName: Kira-${version}-mac.${ext}
+  artifactName: Kira-${version}-mac-${arch}.${ext}
   category: public.app-category.productivity
   icon: build/icon.icns
 win:
