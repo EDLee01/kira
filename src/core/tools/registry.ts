@@ -222,9 +222,11 @@ export interface SubAgentResult {
 export interface ToolExecutionContext {
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
   permissionMode: ToolPermissionMode;
   rules?: ToolPermissionRules;
   outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   stateRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
@@ -259,9 +261,12 @@ export async function executeRegisteredTool(input: {
   cwd: string;
   toolUse: MagiToolUsePart;
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
+  disabledToolNames?: string[];
   permissionMode?: ToolPermissionMode;
   rules?: ToolPermissionRules;
   outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   stateRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
@@ -273,6 +278,9 @@ export async function executeRegisteredTool(input: {
 }): Promise<RegisteredToolResult> {
   const registry = getBuiltinToolRegistry();
   const tool = registry.get(input.toolUse.name);
+  if (input.disabledToolNames?.includes(input.toolUse.name)) {
+    return errorResult(input.toolUse, `${input.toolUse.name} is disabled for this request`);
+  }
   if (!tool) {
     return errorResult(input.toolUse, `Unknown tool: ${input.toolUse.name}`);
   }
@@ -280,9 +288,11 @@ export async function executeRegisteredTool(input: {
     const context: ToolExecutionContext = {
       cwd: input.cwd,
       env: input.env,
+      userIntent: input.userIntent,
       permissionMode: input.permissionMode ?? "default",
       rules: input.rules,
       outputRoot: input.outputRoot,
+      kiraWorkspaceRoot: input.kiraWorkspaceRoot,
       stateRoot: input.stateRoot,
       sessionId: input.sessionId,
       webSearchConfig: input.webSearchConfig,
@@ -298,7 +308,9 @@ export async function executeRegisteredTool(input: {
       mode: context.permissionMode,
       rules: context.rules,
       tool,
-      env: context.env
+      env: context.env,
+      userIntent: context.userIntent,
+      kiraWorkspaceRoot: context.kiraWorkspaceRoot
     });
     // Generate diff preview for FileWrite/FileEdit when approval is needed
     if (permission.decision === "ask" && (input.toolUse.name === "FileWrite" || input.toolUse.name === "FileEdit")) {
@@ -350,9 +362,12 @@ export async function executeRegisteredTools(input: {
   cwd: string;
   toolUses: MagiToolUsePart[];
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
+  disabledToolNames?: string[];
   permissionMode?: ToolPermissionMode;
   rules?: ToolPermissionRules;
   outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   stateRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
@@ -391,6 +406,8 @@ export function checkToolPermission(input: {
   mode: ToolPermissionMode;
   rules?: ToolPermissionRules;
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
+  kiraWorkspaceRoot?: string;
   tool?: RegisteredTool;
 }): ToolPermissionResult {
   const tool = input.tool ?? getBuiltinToolRegistry().get(input.toolUse.name);
@@ -401,7 +418,9 @@ export function checkToolPermission(input: {
     cwd: input.cwd ?? ".",
     permissionMode: input.mode,
     rules: input.rules,
-    env: input.env
+    env: input.env,
+    userIntent: input.userIntent,
+    kiraWorkspaceRoot: input.kiraWorkspaceRoot
   };
   const custom = tool.checkPermissions?.(input.toolUse.input, context);
   if (custom) {
@@ -629,6 +648,8 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         cwd: context.cwd,
         command: readString(input, "command"),
         timeoutMs: readOptionalNumber(input, "timeout_ms"),
+        env: context.env,
+        kiraWorkspaceRoot: context.kiraWorkspaceRoot,
         // Dangerous commands are gated by checkPermissions before this call.
         approveDangerous: true
       });
@@ -642,7 +663,12 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     isDestructive: () => false,
     checkPermissions: (input, context) => {
       const command = readString(input, "command");
-      const workspaceViolation = findWorkspaceShellViolation({ cwd: context.cwd, command });
+      const workspaceViolation = findWorkspaceShellViolation({
+        cwd: context.cwd,
+        command,
+        env: context.env,
+        kiraWorkspaceRoot: context.kiraWorkspaceRoot
+      });
       if (workspaceViolation) {
         return {
           decision: "deny",
@@ -982,7 +1008,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "CronCreate",
-    description: "Create a scheduled task that runs automatically. Use this when the user asks for something to happen on a recurring schedule (e.g. '每天早上9点看知乎热榜', 'every morning check X', 'remind me weekly', 'monitor Z daily'). Convert the user's natural language schedule into a 5-field cron expression (minute hour day-of-month month day-of-week, local time). The prompt field should contain the full instruction for what the AI should do when the task fires.",
+    description: "Create a scheduled task that runs automatically. Use this when the user asks for something to happen on a recurring schedule (e.g. '每天早上9点检查项目状态', 'every morning check X', 'remind me weekly', 'monitor Z daily'). Convert the user's natural language schedule into a 5-field cron expression (minute hour day-of-month month day-of-week, local time). The prompt field should contain the full instruction for what the AI should do when the task fires.",
     category: "schedule",
     tags: ["cron", "schedule", "job"],
     inputSchema: CRON_CREATE_SCHEMA,
@@ -1497,7 +1523,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
       const parsed = parseSnipInput(input);
       const result = await executeSnip({
         format: parsed.format,
-        cwd: context.cwd
+        cwd: context.kiraWorkspaceRoot ?? context.cwd
       });
       return formatSnipResult(result);
     },
@@ -1513,7 +1539,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     inputSchema: ComputerUseInputSchema,
     call: async (input, context) => {
       const parsed = parseComputerUseInput(input);
-      const result = await executeComputerUse(parsed, { cwd: context.cwd });
+      const result = await executeComputerUse(parsed, { cwd: context.kiraWorkspaceRoot ?? context.cwd });
       return formatComputerUseResult(result);
     },
     isReadOnly: (input) => input.action === "screenshot",
@@ -2340,7 +2366,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "Browser",
-    description: "Control a real Chromium browser. Actions: navigate, click, type, scroll, screenshot, extract_text, wait, evaluate, close. Use navigate to open URLs, click to interact, screenshot to see the page (vision), evaluate to run JS. Browser stays open between calls so you can do multiple actions in sequence.",
+    description: "Control a real Chromium browser. Actions: navigate, click, type, scroll, screenshot, extract_text, wait, evaluate, close. Only navigate to URLs explicitly requested by the user or already visible on the current page; never open example, trending, hot-list, or fallback sites on your own. Use click/type only when the user asked for that interaction or after inspecting the page. Browser stays open between calls so you can do multiple actions in sequence.",
     category: "web",
     tags: ["browser", "web", "automation", "playwright"],
     inputSchema: BrowserActionInputSchema,
@@ -2363,6 +2389,9 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         return undefined;
       }
       const action = String(input.action ?? "");
+      if (action === "navigate") {
+        return checkBrowserNavigationPermission(input, context);
+      }
       if (action === "click" || action === "type" || action === "evaluate") {
         return { decision: "ask", reason: `Browser ${action} can interact with a live website` };
       }
@@ -2371,6 +2400,101 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
     isConcurrencySafe: () => false
   }
 ];
+
+const BROWSER_SITE_ALIASES: Array<{ hosts: string[]; aliases: string[] }> = [
+  { hosts: ["xiaohongshu.com", "xhslink.com"], aliases: ["小红书", "xiaohongshu", "xhs", "rednote"] },
+  { hosts: ["zhihu.com"], aliases: ["知乎", "zhihu"] },
+  { hosts: ["weibo.com"], aliases: ["微博", "weibo"] },
+  { hosts: ["bilibili.com"], aliases: ["哔哩哔哩", "bilibili", "b站", "b 站"] },
+  { hosts: ["douyin.com"], aliases: ["抖音", "douyin"] },
+  { hosts: ["toutiao.com"], aliases: ["头条", "toutiao"] },
+  { hosts: ["baidu.com"], aliases: ["百度", "baidu"] },
+  { hosts: ["bing.com"], aliases: ["必应", "bing"] },
+  { hosts: ["google.com"], aliases: ["谷歌", "google"] },
+  { hosts: ["github.com"], aliases: ["github"] },
+  { hosts: ["youtube.com", "youtu.be"], aliases: ["youtube", "油管"] }
+];
+
+function checkBrowserNavigationPermission(
+  input: Record<string, unknown>,
+  context: ToolExecutionContext
+): ToolPermissionResult | undefined {
+  const rawUrl = typeof input.url === "string" ? input.url : "";
+  if (!rawUrl || !isHotOrTrendingUrl(rawUrl) || browserUrlMatchesUserIntent(rawUrl, context.userIntent ?? "")) {
+    return undefined;
+  }
+  return {
+    decision: "ask",
+    reason: `Browser navigate target looks like a hot/trending page that was not explicitly requested: ${rawUrl}`
+  };
+}
+
+function browserUrlMatchesUserIntent(rawUrl: string, userIntent: string): boolean {
+  const normalizedIntent = normalizeIntent(userIntent);
+  if (!normalizedIntent) {
+    return false;
+  }
+  const parsed = parseBrowserUrl(rawUrl);
+  const normalizedUrl = normalizeIntent(rawUrl);
+  if (normalizedIntent.includes(normalizedUrl)) {
+    return true;
+  }
+  if (parsed) {
+    const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+    if (normalizedIntent.includes(host)) {
+      return true;
+    }
+    const hostParts = host.split(".");
+    if (hostParts.length > 1 && normalizedIntent.includes(hostParts[0])) {
+      return true;
+    }
+    const matchedAlias = BROWSER_SITE_ALIASES.find((site) => site.hosts.some((knownHost) => host === knownHost || host.endsWith(`.${knownHost}`)));
+    if (matchedAlias?.aliases.some((alias) => normalizedIntent.includes(normalizeIntent(alias)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isHotOrTrendingUrl(rawUrl: string): boolean {
+  const decoded = normalizeIntent(safeDecodeURIComponent(rawUrl));
+  const parsed = parseBrowserUrl(rawUrl);
+  if (/热榜|热门|榜单|排行榜|热搜|hotsearch|hot-list|trending|ranking|rank-list/.test(decoded)) {
+    return true;
+  }
+  if (!parsed) {
+    return false;
+  }
+  const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
+  const path = parsed.pathname.toLowerCase();
+  const search = parsed.search.toLowerCase();
+  return (host.endsWith("zhihu.com") && path.startsWith("/hot"))
+    || (host.endsWith("weibo.com") && (path.includes("hot") || search.includes("containerid=106003")))
+    || (host === "s.weibo.com" && path.includes("/top/summary"))
+    || (host.endsWith("toutiao.com") && path.includes("hot-event"))
+    || host === "tophub.today"
+    || (host.endsWith("36kr.com") && path.includes("hot-list"));
+}
+
+function parseBrowserUrl(rawUrl: string): URL | undefined {
+  try {
+    return new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeIntent(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, "");
+}
 
 function matchRules(toolUse: MagiToolUsePart, rules: ToolPermissionRules | undefined): ToolPermissionResult | undefined {
   for (const [decision, list] of [

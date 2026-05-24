@@ -13,6 +13,7 @@
   --accent-hover: #7d6ff0;
   --accent-glow: rgba(108, 92, 231, 0.12);
   --user-bg: #6c5ce7;
+  --warning: #f2b84b;
   --error: #ef5350;
   --error-bg: rgba(239, 83, 80, 0.08);
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
@@ -36,6 +37,7 @@
   --accent-hover: #5a4bd6;
   --accent-glow: rgba(108, 92, 231, 0.08);
   --user-bg: #6c5ce7;
+  --warning: #b26a00;
   --error: #e53935;
   --error-bg: rgba(229, 57, 53, 0.06);
   --shadow: 0 2px 12px rgba(0,0,0,0.08);
@@ -130,7 +132,10 @@ body {
   font-size: 11px;
   cursor: pointer;
   transition: all 0.15s;
-  max-width: 140px;
+  max-width: 190px;
+}
+.workspace-btn.external {
+  color: var(--warning);
 }
 .workspace-btn:hover {
   background: var(--surface2);
@@ -140,6 +145,15 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.workspace-badge {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+  font-family: var(--font);
+  font-size: 9px;
+  text-transform: uppercase;
 }
 .status-dot {
   width: 7px;
@@ -1002,6 +1016,15 @@ body {
   padding: 14px 0;
   border-top: 1px solid var(--border);
 }
+.settings-body .settings-section {
+  margin: 0;
+}
+.settings-section.compact {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+}
 .settings-section-header {
   display: flex;
   align-items: center;
@@ -1014,6 +1037,34 @@ body {
   color: var(--fg2);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+.workspace-settings-grid {
+  display: grid;
+  gap: 10px;
+}
+.workspace-settings-grid > div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.workspace-settings-grid b {
+  color: var(--fg2);
+  font-size: 11px;
+  font-weight: 600;
+}
+.workspace-settings-grid code {
+  min-width: 0;
+  padding: 5px 7px;
+  overflow: hidden;
+  color: var(--fg3);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
 }
 .remote-toggle {
   padding: 4px 12px;

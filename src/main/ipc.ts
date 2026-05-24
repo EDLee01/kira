@@ -9,6 +9,13 @@ import { startRemoteServer, stopRemoteServer, isRunning as isRemoteRunning, getT
 import { startTunnel, stopTunnel, getTunnelUrl, isTunnelRunning } from "./tunnel";
 import { applyDesktopSettingsToEnv, readDesktopSettings, writeDesktopSettings } from "./settings-store";
 import {
+  buildKiraWorkspaceInfo,
+  defaultKiraWorkspaceRoot,
+  defaultProjectDir,
+  ensureKiraWorkspace,
+  type KiraWorkspaceInfo
+} from "../core/kira-workspace.ts";
+import {
   discoverModels,
   modelDiscoveryFromSettings,
   normalizeProviderBaseUrl,
@@ -49,6 +56,27 @@ function tryNormalizeWorkspacePath(dir: string | undefined): string | null {
   }
 }
 
+function normalizeKiraWorkspaceRoot(dir: string): string {
+  const normalized = path.resolve(dir.trim());
+  if (!normalized) {
+    throw new Error("Kira workspace path is empty");
+  }
+  ensureKiraWorkspace(normalized);
+  return normalized;
+}
+
+function readWorkspaceInfo(settings: Record<string, string>): KiraWorkspaceInfo {
+  const root = normalizeKiraWorkspaceRoot(settings.kiraWorkspaceRoot || defaultKiraWorkspaceRoot());
+  const project = tryNormalizeWorkspacePath(settings.workspace) ?? ensureProjectDir(root);
+  return buildKiraWorkspaceInfo(root, project);
+}
+
+function ensureProjectDir(root: string): string {
+  const project = defaultProjectDir(root);
+  fs.mkdirSync(project, { recursive: true });
+  return project;
+}
+
 export function registerIPC(win: BrowserWindow): void {
   const paths = getMagiPaths(process.env);
   const store = SessionStore.open(paths);
@@ -58,7 +86,7 @@ export function registerIPC(win: BrowserWindow): void {
   const writeSettings = (settings: Record<string, string>) => writeDesktopSettings(paths, settings);
   const normalizeIncomingSettings = (settings: Record<string, unknown>): Record<string, string> => {
     const normalized: Record<string, string> = {};
-    for (const key of ["provider", "baseUrl", "apiKey", "model", "openAiEndpoint", "theme", "workspace"]) {
+    for (const key of ["provider", "baseUrl", "apiKey", "model", "openAiEndpoint", "theme", "workspace", "kiraWorkspaceRoot"]) {
       const value = settings[key];
       if (typeof value === "string") normalized[key] = value;
     }
@@ -151,28 +179,47 @@ export function registerIPC(win: BrowserWindow): void {
   // Restore saved workspace. If the directory disappeared, do not keep showing
   // a stale path that points somewhere the user cannot actually open.
   const savedSettings = readSettings();
-  const restoredWorkspace = tryNormalizeWorkspacePath(savedSettings.workspace);
-  if (restoredWorkspace) {
-    engine.cwd = restoredWorkspace;
-    if (restoredWorkspace !== savedSettings.workspace) {
-      const s = readSettings();
-      s.workspace = restoredWorkspace;
-      writeSettings(s);
-    }
-  } else if (savedSettings.workspace) {
-    const s = readSettings();
-    delete s.workspace;
-    writeSettings(s);
+  const initialInfo = readWorkspaceInfo(savedSettings);
+  engine.kiraWorkspaceRoot = initialInfo.root;
+  engine.cwd = initialInfo.projectDir;
+  const persisted = readSettings();
+  if (persisted.kiraWorkspaceRoot !== initialInfo.root || persisted.workspace !== initialInfo.projectDir) {
+    persisted.kiraWorkspaceRoot = initialInfo.root;
+    persisted.workspace = initialInfo.projectDir;
+    writeSettings(persisted);
   }
 
   ipcMain.handle("workspace:get", () => {
-    return engine.cwd;
+    return buildKiraWorkspaceInfo(engine.kiraWorkspaceRoot, engine.cwd);
+  });
+
+  ipcMain.handle("workspace:pick-root", async () => {
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory", "createDirectory"],
+      title: "选择 Kira 工作空间",
+      defaultPath: engine.kiraWorkspaceRoot
+    });
+    if (!result.canceled && result.filePaths[0]) {
+      const root = normalizeKiraWorkspaceRoot(result.filePaths[0]);
+      const project = ensureProjectDir(root);
+      engine.kiraWorkspaceRoot = root;
+      engine.cwd = project;
+      const s = readSettings();
+      s.kiraWorkspaceRoot = root;
+      s.workspace = project;
+      writeSettings(s);
+      return buildKiraWorkspaceInfo(root, project);
+    }
+    return null;
   });
 
   ipcMain.handle("workspace:pick", async () => {
+    const defaultPath = path.join(engine.kiraWorkspaceRoot, "projects");
+    fs.mkdirSync(defaultPath, { recursive: true });
     const result = await dialog.showOpenDialog(win, {
-      properties: ["openDirectory"],
-      title: "选择工作区",
+      properties: ["openDirectory", "createDirectory"],
+      title: "选择项目目录",
+      defaultPath
     });
     if (!result.canceled && result.filePaths[0]) {
       const workspace = normalizeWorkspacePath(result.filePaths[0]);
@@ -180,8 +227,9 @@ export function registerIPC(win: BrowserWindow): void {
       // Persist
       const s = readSettings();
       s.workspace = workspace;
+      s.kiraWorkspaceRoot = engine.kiraWorkspaceRoot;
       writeSettings(s);
-      return engine.cwd;
+      return buildKiraWorkspaceInfo(engine.kiraWorkspaceRoot, engine.cwd);
     }
     return null;
   });
@@ -191,8 +239,9 @@ export function registerIPC(win: BrowserWindow): void {
     engine.cwd = workspace;
     const s = readSettings();
     s.workspace = workspace;
+    s.kiraWorkspaceRoot = engine.kiraWorkspaceRoot;
     writeSettings(s);
-    return engine.cwd;
+    return buildKiraWorkspaceInfo(engine.kiraWorkspaceRoot, engine.cwd);
   });
 
   // ── Scheduled Tasks ──
@@ -246,6 +295,8 @@ export function registerIPC(win: BrowserWindow): void {
       availableModels: modelDiscovery.models,
       autoRoutes: modelDiscovery.auto,
       modelsUpdatedAt: modelDiscovery.updatedAt,
+      kiraWorkspaceRoot: engine.kiraWorkspaceRoot,
+      workspace: engine.cwd,
     };
   });
 

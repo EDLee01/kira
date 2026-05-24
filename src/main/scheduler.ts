@@ -8,6 +8,7 @@ import { SessionStore } from "../core/session-store.ts";
 import { MagiPaths } from "../core/paths.ts";
 import { ProviderAdapter } from "../core/providers/ir.ts";
 import { takeDueCronJobs, cronStorePathFromRoot, CronRunResult } from "../core/tools/cron.ts";
+import { buildKiraWorkspaceEnv, ensureKiraWorkspace } from "../core/kira-workspace.ts";
 
 const POLL_INTERVAL_MS = 30_000;
 
@@ -21,11 +22,12 @@ export interface SchedulerDeps {
     env: NodeJS.ProcessEnv;
   };
   getWorkspace?: () => string;
+  getKiraWorkspaceRoot?: () => string;
   win: BrowserWindow;
 }
 
 export function startScheduler(deps: SchedulerDeps): () => void {
-  const { store, paths, getProvider, getWorkspace, win } = deps;
+  const { store, paths, getProvider, getWorkspace, getKiraWorkspaceRoot, win } = deps;
   const cronPath = cronStorePathFromRoot(paths.stateRoot);
   let running = false;
 
@@ -52,6 +54,7 @@ export function startScheduler(deps: SchedulerDeps): () => void {
 
   async function executeTask(item: CronRunResult) {
     const cwd = getWorkspace?.() ?? process.cwd();
+    const kiraWorkspaceRoot = getKiraWorkspaceRoot?.();
     const taskId = store.createAgentTask({
       role: "worker",
       prompt: item.prompt,
@@ -65,6 +68,9 @@ export function startScheduler(deps: SchedulerDeps): () => void {
     let resultText = "";
     try {
       const provider = getProvider();
+      const queryEnv = kiraWorkspaceRoot
+        ? buildKiraWorkspaceEnv({ root: kiraWorkspaceRoot, projectDir: cwd, env: provider.env })
+        : provider.env;
       const messages = [{ role: "user" as const, content: [{ type: "text" as const, text: item.prompt }] }];
 
       for await (const event of runAgentQuery({
@@ -73,7 +79,9 @@ export function startScheduler(deps: SchedulerDeps): () => void {
         providerName: provider.providerName,
         messages,
         cwd,
-        env: provider.env,
+        env: queryEnv,
+        kiraWorkspaceRoot,
+        outputRoot: kiraWorkspaceRoot ? ensureKiraWorkspace(kiraWorkspaceRoot).artifactsRoot : undefined,
         permissionMode: "auto",
       })) {
         if (event.type === "text_delta" && event.text) {

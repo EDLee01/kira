@@ -16,6 +16,7 @@ const api = {
 
   // Workspace
   getWorkspace: () => ipcRenderer.invoke("workspace:get"),
+  pickKiraWorkspaceRoot: () => ipcRenderer.invoke("workspace:pick-root"),
   pickWorkspace: () => ipcRenderer.invoke("workspace:pick"),
   setWorkspace: (dir: string) => ipcRenderer.invoke("workspace:set", dir),
 

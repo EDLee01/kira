@@ -108,7 +108,7 @@ async function closeBrowser(): Promise<void> {
 export const BrowserNavigateInputSchema = {
   type: "object",
   properties: {
-    url: { type: "string", description: "Full URL to navigate to (including protocol, e.g. https://www.zhihu.com)" }
+    url: { type: "string", description: "Full URL to navigate to. Must come from the user's explicit request or the currently visible page; do not invent a default destination." }
   },
   required: ["url"],
   additionalProperties: false
@@ -122,7 +122,7 @@ export const BrowserActionInputSchema = {
       enum: ["navigate", "click", "type", "scroll", "screenshot", "extract_text", "wait", "evaluate", "close"],
       description: "Browser action to perform"
     },
-    url: { type: "string", description: "URL for the navigate action" },
+    url: { type: "string", description: "URL for the navigate action. Must be explicitly requested by the user or selected from the current page." },
     selector: { type: "string", description: "CSS selector (for click, type, extract_text)" },
     text: { type: "string", description: "Text to type (for the type action)" },
     direction: {

@@ -4,12 +4,16 @@
  */
 import { BrowserWindow, dialog } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
-import { textMessage } from "../core/providers/ir.ts";
+import { MagiContentPart, textMessage } from "../core/providers/ir.ts";
 import { McpServerConfig } from "../core/config.ts";
 import { getMagiPaths, MagiPaths } from "../core/paths.ts";
 import { SessionStore } from "../core/session-store.ts";
 import { compactSession, recoverSessionContext } from "../core/context/compaction.ts";
+import { buildLayeredContext } from "../core/context/layers.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
+import { buildSystemInstructions } from "../core/agent/system-prompt.ts";
+import { getBuiltinToolDefinitions } from "../core/tools/registry.ts";
+import { buildKiraWorkspaceEnv, defaultKiraWorkspaceRoot, ensureKiraWorkspace } from "../core/kira-workspace.ts";
 import { buildDesktopProvider } from "./desktop-provider";
 
 export class Engine {
@@ -17,6 +21,7 @@ export class Engine {
   private _running = false;
   private _sessionId: string | null = null;
   private _cwd: string = process.cwd();
+  private _kiraWorkspaceRoot: string = defaultKiraWorkspaceRoot();
   private _mcpServers: Record<string, McpServerConfig> = {};
   private win: BrowserWindow;
   private store: SessionStore;
@@ -31,6 +36,11 @@ export class Engine {
   get sessionId(): string | null { return this._sessionId; }
   get cwd(): string { return this._cwd; }
   set cwd(dir: string) { this._cwd = dir; }
+  get kiraWorkspaceRoot(): string { return this._kiraWorkspaceRoot; }
+  set kiraWorkspaceRoot(dir: string) {
+    this._kiraWorkspaceRoot = dir;
+    ensureKiraWorkspace(dir);
+  }
   get mcpServers(): Record<string, McpServerConfig> { return this._mcpServers; }
   set mcpServers(servers: Record<string, McpServerConfig>) { this._mcpServers = servers; }
 
@@ -57,26 +67,50 @@ export class Engine {
     this.abortController = new AbortController();
 
     try {
+      const identityResponse = identityAnswer(userMessage);
+      if (identityResponse) {
+        this.emit("engine:status", { running: true, sessionId });
+        this.emit("engine:stream-event", { type: "text_delta", text: identityResponse });
+        this.store.appendMessage({
+          sessionId,
+          role: "assistant",
+          content: JSON.stringify([{ type: "text", text: identityResponse }]),
+          metadata: { local: true, kind: "identity" },
+        });
+        this.emit("engine:stream-event", { type: "done", text: identityResponse, messages: [] });
+        return;
+      }
+
       const paths = getMagiPaths(process.env);
       const runtime = this.buildProvider(paths);
       const { adapter, model, providerName, env } = runtime;
+      const workspaceEnv = buildKiraWorkspaceEnv({
+        root: this._kiraWorkspaceRoot,
+        projectDir: this._cwd,
+        env
+      });
 
       // Load session messages from DB (user message already appended by ipc.ts)
       const session = this.store.getSession(sessionId);
       const rawMessages = session?.messages ?? [];
 
-      // Auto-compact if context is too large (~4 chars/token, threshold 80k tokens)
+      // Auto-compact when either token or message volume starts to hurt response quality.
       const totalChars = rawMessages.reduce((sum: number, m: any) => sum + (m.content?.length ?? 0), 0);
       const estimatedTokens = Math.ceil(totalChars / 4);
       const COMPACT_THRESHOLD = 80_000;
+      const MESSAGE_THRESHOLD = 80;
+      const latestSummary = this.store.getLatestContextSummary(sessionId);
+      const messagesSinceCompact = latestSummary
+        ? Math.max(0, rawMessages.length - latestSummary.sourceMessageCount)
+        : rawMessages.length;
 
-      if (estimatedTokens > COMPACT_THRESHOLD && rawMessages.length > 30) {
+      if (rawMessages.length > 30 && (estimatedTokens > COMPACT_THRESHOLD || messagesSinceCompact > MESSAGE_THRESHOLD)) {
         try {
           const result = compactSession({
             store: this.store,
             sessionId,
-            recentMessages: 20,
-            maxSummaryChars: 6000,
+            recentMessages: 30,
+            maxSummaryChars: 8000,
           });
           this.emit("engine:stream-event", {
             type: "compact_boundary",
@@ -91,36 +125,40 @@ export class Engine {
       const recovered = recoverSessionContext({
         store: this.store,
         sessionId,
-        recentMessages: 20,
+        recentMessages: 30,
       });
 
       // Build messages: prepend summary if exists, then recent messages
       const messages: any[] = [];
       const goalContext = formatGoalContext(getGoal(paths, sessionId));
-      if (goalContext) {
-        messages.push(textMessage("system", goalContext));
-      }
+      const { systemPrompt } = buildLayeredContext({
+        cwd: this._cwd,
+        paths,
+        systemInstructions: buildSystemInstructions({
+          cwd: this._cwd,
+          platform: process.platform,
+          toolCount: getBuiltinToolDefinitions().filter((tool) => tool.name !== "Browser").length
+        }),
+        memoryContext: goalContext || undefined,
+        includeGit: true,
+        includeDate: true,
+        platform: process.platform
+      });
+      messages.push(textMessage("system", systemPrompt));
       if (recovered.summary) {
-        messages.push({
-          role: "user",
-          content: [{ type: "text", text: `[Context summary from earlier in this conversation]\n${recovered.summary.summary}` }],
-        });
-        messages.push({
-          role: "assistant",
-          content: [{ type: "text", text: "Understood. I have the context from our earlier conversation. Continuing." }],
-        });
+        messages.push(textMessage("system", `[Previous conversation summary]\n${recovered.summary.summary}`));
       }
 
       // Parse recent messages into MagiMessage format
       for (const m of recovered.recentMessages) {
-        let content = m.content;
+        let content: unknown = m.content;
         if (typeof content === "string") {
           try { content = JSON.parse(content); } catch { content = [{ type: "text", text: content }]; }
         }
         if (!Array.isArray(content)) {
           content = [content];
         }
-        messages.push({ role: m.role, content });
+        messages.push({ role: m.role, content: content as MagiContentPart[] });
       }
 
       this.emit("engine:status", { running: true, sessionId });
@@ -139,8 +177,10 @@ export class Engine {
         providerName,
         messages,
         cwd: this._cwd,
-        env,
+        env: workspaceEnv,
         stateRoot: paths.stateRoot,
+        outputRoot: ensureKiraWorkspace(this._kiraWorkspaceRoot).artifactsRoot,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
         sessionId,
         signal: this.abortController.signal,
         permissionMode: "auto",
@@ -169,18 +209,6 @@ export class Engine {
               "",
               `Command: ${String(toolUse.input.command ?? "").slice(0, 1000)}`
             ].join("\n");
-          } else if (toolUse.name === "Browser") {
-            title = "Allow Kira to interact with the browser?";
-            message = "Kira wants to click, type, or run script in a live browser page.";
-            detail = [
-              reason,
-              "",
-              `Action: ${String(toolUse.input.action ?? "")}`,
-              toolUse.input.url !== undefined ? `URL: ${String(toolUse.input.url).slice(0, 500)}` : undefined,
-              toolUse.input.selector !== undefined ? `Selector: ${String(toolUse.input.selector).slice(0, 500)}` : undefined,
-              toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
-              toolUse.input.script !== undefined ? `Script: ${String(toolUse.input.script).slice(0, 500)}` : undefined
-            ].filter((line): line is string => Boolean(line)).join("\n");
           } else if (toolUse.name === "KillProcess") {
             title = "Allow Kira to close this process?";
             message = "Kira wants to terminate a running process.";
@@ -285,4 +313,16 @@ function hasRuntimeApiKey(runtime: ReturnType<typeof buildDesktopProvider>): boo
 
 function hideEncodedImages(content: string): string {
   return content.replace(/<<MAGI_IMAGE:[\s\S]*?:MAGI_IMAGE>>/g, "[Screenshot provided to the vision model]");
+}
+
+function identityAnswer(text: string): string | undefined {
+  const normalized = text.trim().toLowerCase().replace(/\s+/g, "");
+  if (!normalized) {
+    return undefined;
+  }
+  const asksIdentity = /(你是谁|你叫什么|怎么称呼你|我应该怎么称呼你|whatareyou|whoareyou|what'syourname|whatisyourname)/i.test(normalized);
+  if (!asksIdentity) {
+    return undefined;
+  }
+  return "我是 Kira，一个本地优先的 AI agent 桌面助手。你可以叫我 Kira。";
 }

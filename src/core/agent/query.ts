@@ -6,6 +6,7 @@ import {
   ProviderRequest,
   ProviderResponse,
   ProviderUsage,
+  messageText,
   parsePromptIntoParts,
   textMessage
 } from "../providers/ir.ts";
@@ -68,11 +69,14 @@ export interface AgentQueryInput {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   stateRoot?: string;
+  outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   webSearchConfig?: WebSearchConfig;
   maxTurns?: number;
   temperature?: number;
   maxOutputTokens?: number;
   permissionMode?: ToolPermissionMode;
+  disabledBuiltinTools?: string[];
   approvalResolver?: (request: { toolUse: MagiToolUsePart; reason: string; diff?: string }) => Promise<boolean> | boolean;
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
@@ -109,13 +113,15 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
   let activeRoute = routes[routeIndex];
   let finalText = "";
   const mcpTools = input.mcp ? new McpToolRegistry({ servers: input.mcp.servers, env: input.env, tokenLookup: input.mcp.tokenLookup, tokenRefresh: input.mcp.tokenRefresh }) : undefined;
+  const currentUserIntent = latestUserText(input.messages);
+  const disabledBuiltinTools = new Set(["Browser", ...(input.disabledBuiltinTools ?? [])]);
 
   try {
-    const toolDefinitions = await getAgentToolDefinitions(mcpTools);
     yield { type: "request_start" };
 
     for (let turn = 0; turn < maxTurns; turn++) {
       throwIfCancelled(input.signal);
+      const toolDefinitions = await getAgentToolDefinitions(mcpTools, disabledBuiltinTools);
       let response: ProviderResponse;
       let streamedTextThisTurn = "";
       while (true) {
@@ -259,7 +265,7 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
         throwIfCancelled(input.signal);
         const response = await activeRoute.adapter.complete({ model: activeRoute.model, messages, signal: input.signal });
         return { text: response.text };
-      });
+      }, disabledBuiltinTools);
       for (const event of executed.events) {
         yield event;
       }
@@ -479,7 +485,8 @@ async function executePreparedToolUses(
   input: AgentQueryInput,
   prepared: PreparedToolUses,
   mcpTools: McpToolRegistry | undefined,
-  promptModel: (request: { messages: MagiMessage[] }) => Promise<{ text: string }>
+  promptModel: (request: { messages: MagiMessage[] }) => Promise<{ text: string }>,
+  disabledBuiltinTools: ReadonlySet<string>
 ): Promise<ExecutedToolUses> {
   const results = prepared.results;
   const events: AgentQueryEvent[] = [];
@@ -490,7 +497,11 @@ async function executePreparedToolUses(
       cwd: input.cwd,
       toolUses: builtIn.map(({ toolUse }) => toolUse),
       env: input.env,
+      userIntent: latestUserText(input.messages),
+      disabledToolNames: [...disabledBuiltinTools],
       stateRoot: input.stateRoot,
+      outputRoot: input.outputRoot,
+      kiraWorkspaceRoot: input.kiraWorkspaceRoot,
       sessionId: input.sessionId,
       webSearchConfig: input.webSearchConfig,
       permissionMode: input.permissionMode,
@@ -558,14 +569,18 @@ async function executePreparedToolUses(
   };
 }
 
-async function getAgentToolDefinitions(mcpTools: McpToolRegistry | undefined): Promise<MagiToolDefinition[]> {
+async function getAgentToolDefinitions(
+  mcpTools: McpToolRegistry | undefined,
+  disabledBuiltinTools: ReadonlySet<string> = new Set()
+): Promise<MagiToolDefinition[]> {
+  const builtInTools = BUILTIN_AGENT_TOOLS.filter((tool) => !disabledBuiltinTools.has(tool.name));
   if (!mcpTools) {
-    return BUILTIN_AGENT_TOOLS;
+    return builtInTools;
   }
   const dynamic = await mcpTools.getToolDefinitions();
   const builtInNames = new Set(BUILTIN_AGENT_TOOLS.map((tool) => tool.name));
   return [
-    ...BUILTIN_AGENT_TOOLS,
+    ...builtInTools,
     ...dynamic.filter((tool) => !builtInNames.has(tool.name))
   ];
 }
@@ -577,6 +592,16 @@ export async function collectAgentQuery(input: AgentQueryInput): Promise<AgentQu
     next = await iterator.next();
   }
   return next.value;
+}
+
+function latestUserText(messages: MagiMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "user") {
+      return messageText(message);
+    }
+  }
+  return "";
 }
 
 function normalizeToolUses(toolUses: MagiToolUsePart[] | undefined): MagiToolUsePart[] {

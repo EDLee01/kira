@@ -35,7 +35,7 @@ export function parseSnipInput(input: Record<string, unknown>): { format: string
 
 export async function executeSnip(input: { format: string; cwd: string }): Promise<SnipResult> {
   const platform = os.platform();
-  const tmpDir = path.join(input.cwd, ".magi-snip");
+  const tmpDir = path.join(input.cwd, "artifacts", "screenshots");
 
   // Ensure temp directory exists
   if (!existsSync(tmpDir)) {

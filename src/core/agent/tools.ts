@@ -28,7 +28,11 @@ export async function executeBuiltinAgentTool(input: {
   cwd: string;
   toolUse: MagiToolUsePart;
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
+  disabledToolNames?: string[];
   stateRoot?: string;
+  outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
   permissionMode?: ToolPermissionMode;
@@ -42,7 +46,11 @@ export async function executeBuiltinAgentTool(input: {
     cwd: input.cwd,
     toolUse: input.toolUse,
     env: input.env,
+    userIntent: input.userIntent,
+    disabledToolNames: input.disabledToolNames,
     stateRoot: input.stateRoot,
+    outputRoot: input.outputRoot,
+    kiraWorkspaceRoot: input.kiraWorkspaceRoot,
     sessionId: input.sessionId,
     webSearchConfig: input.webSearchConfig,
     permissionMode: input.permissionMode ?? "acceptEdits",
@@ -58,7 +66,11 @@ export async function executeBuiltinAgentTools(input: {
   cwd: string;
   toolUses: MagiToolUsePart[];
   env?: NodeJS.ProcessEnv;
+  userIntent?: string;
+  disabledToolNames?: string[];
   stateRoot?: string;
+  outputRoot?: string;
+  kiraWorkspaceRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
   permissionMode?: ToolPermissionMode;
@@ -72,7 +84,11 @@ export async function executeBuiltinAgentTools(input: {
     cwd: input.cwd,
     toolUses: input.toolUses,
     env: input.env,
+    userIntent: input.userIntent,
+    disabledToolNames: input.disabledToolNames,
     stateRoot: input.stateRoot,
+    outputRoot: input.outputRoot,
+    kiraWorkspaceRoot: input.kiraWorkspaceRoot,
     sessionId: input.sessionId,
     webSearchConfig: input.webSearchConfig,
     permissionMode: input.permissionMode ?? "acceptEdits",

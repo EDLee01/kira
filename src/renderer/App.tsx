@@ -34,6 +34,15 @@ interface SettingsState {
   availableModels?: DiscoveredModel[];
   autoRoutes?: AutoModelRoutes;
   modelsUpdatedAt?: string;
+  kiraWorkspaceRoot?: string;
+  workspace?: string;
+}
+
+interface WorkspaceInfo {
+  root: string;
+  projectDir: string;
+  projectsRoot: string;
+  isProjectInsideWorkspace: boolean;
 }
 
 declare global {
@@ -47,8 +56,9 @@ declare global {
       deleteSession: (id: string) => Promise<void>;
       renameSession: (id: string, title: string) => Promise<void>;
       getSession: (id: string) => Promise<any>;
-      getWorkspace: () => Promise<string>;
-      pickWorkspace: () => Promise<string | null>;
+      getWorkspace: () => Promise<WorkspaceInfo>;
+      pickKiraWorkspaceRoot: () => Promise<WorkspaceInfo | null>;
+      pickWorkspace: () => Promise<WorkspaceInfo | null>;
       getSettings: () => Promise<SettingsState>;
       setSettings: (s: SettingsState) => Promise<SettingsState>;
       testConnection: (s: { provider?: string; baseUrl: string; apiKey: string; model: string; openAiEndpoint?: string }) => Promise<{ ok: boolean; message: string; discovery?: { models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string } }>;
@@ -92,9 +102,9 @@ function displaySessionTitle(title: string | null | undefined, fallback = "Untit
   return title.trim() === "Magi" ? DEFAULT_SESSION_TITLE : title;
 }
 
-function displayWorkspacePath(workspace: string): string {
-  const trimmed = workspace.trim().replace(/[\\/]+$/, "");
-  if (!trimmed) return "Workspace";
+function displayPathName(workspace: string | undefined, fallback = "Workspace"): string {
+  const trimmed = (workspace ?? "").trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return fallback;
   const parts = trimmed.split(/[\\/]+/);
   return parts[parts.length - 1] || trimmed;
 }
@@ -180,7 +190,7 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "tasks">("chat");
-  const [workspace, setWorkspace] = useState("");
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [settings, setSettings] = useState<SettingsState>({ provider: "anthropic", baseUrl: "", apiKey: "", model: "", openAiEndpoint: "chat", theme: "dark" });
   const streamText = useRef("");
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -202,8 +212,8 @@ export default function App() {
 
     (async () => {
       // Load workspace
-      const cwd = await window.desktopAPI.getWorkspace();
-      setWorkspace(cwd);
+      const info = await window.desktopAPI.getWorkspace();
+      setWorkspace(info);
 
       // Load settings
       const s = await window.desktopAPI.getSettings();
@@ -361,8 +371,8 @@ export default function App() {
 
   // Pick workspace
   const pickWorkspace = useCallback(async () => {
-    const dir = await window.desktopAPI.pickWorkspace();
-    if (dir) setWorkspace(dir);
+    const info = await window.desktopAPI.pickWorkspace();
+    if (info) setWorkspace(info);
   }, []);
 
   // Save settings
@@ -446,6 +456,9 @@ export default function App() {
   }, []);
 
   const currentTitle = displaySessionTitle(sessions.find((s) => s.id === sid)?.title, DEFAULT_SESSION_TITLE);
+  const workspaceTitle = workspace
+    ? `Kira Workspace: ${workspace.root}\nProject: ${workspace.projectDir}`
+    : "Kira Workspace";
 
   return (
     <div className="app">
@@ -462,11 +475,12 @@ export default function App() {
           <span className="titlebar-name">{currentTitle}</span>
         </div>
         <div className="titlebar-status">
-          <button className="workspace-btn" onClick={pickWorkspace} title={workspace}>
+          <button className={`workspace-btn ${workspace && !workspace.isProjectInsideWorkspace ? "external" : ""}`} onClick={pickWorkspace} title={workspaceTitle}>
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
               <path d="M2 4.5V11a1 1 0 001 1h8a1 1 0 001-1V5.5a1 1 0 00-1-1H7L5.5 3H3a1 1 0 00-1 1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
-            <span className="workspace-path">{displayWorkspacePath(workspace)}</span>
+            <span className="workspace-path">{displayPathName(workspace?.projectDir, "Project")}</span>
+            {workspace && !workspace.isProjectInsideWorkspace && <span className="workspace-badge">external</span>}
           </button>
           <button className="settings-btn" onClick={() => setShowSettings(!showSettings)} title="Settings">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
@@ -521,6 +535,8 @@ export default function App() {
       {showSettings && (
         <SettingsPanel
           settings={settings}
+          workspace={workspace}
+          onWorkspaceChange={setWorkspace}
           onSave={saveSettings}
           onClose={() => setShowSettings(false)}
         />
@@ -550,7 +566,7 @@ export default function App() {
             <h2 className="empty-title">Kira</h2>
             <p className="empty-sub">你的全能 AI 搭子，随时待命</p>
             <div className="suggestions">
-              {["帮我打开知乎热榜", "搜索一下竞品信息", "帮我整理今天的工作"].map((s) => (
+              {["打开浏览器访问指定网址", "搜索一下竞品信息", "帮我整理今天的工作"].map((s) => (
                 <button key={s} className="suggestion" onClick={() => setInput(s)}>
                   {s}
                 </button>
@@ -647,8 +663,10 @@ export default function App() {
 }
 
 /** Settings Panel */
-function SettingsPanel({ settings, onSave, onClose }: {
+function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose }: {
   settings: SettingsState;
+  workspace: WorkspaceInfo | null;
+  onWorkspaceChange: (workspace: WorkspaceInfo) => void;
   onSave: (s: SettingsState) => void;
   onClose: () => void;
 }) {
@@ -669,6 +687,28 @@ function SettingsPanel({ settings, onSave, onClose }: {
       ? "https://api.openai.com/v1"
       : "https://your-provider.example.com/v1";
   const modelPlaceholder = provider === "anthropic" ? "claude-sonnet-4-6" : "gpt-4.1-mini";
+
+  const pickRoot = async () => {
+    const info = await window.desktopAPI.pickKiraWorkspaceRoot();
+    if (!info) return;
+    onWorkspaceChange(info);
+    setForm((current) => ({
+      ...current,
+      kiraWorkspaceRoot: info.root,
+      workspace: info.projectDir,
+    }));
+  };
+
+  const pickProject = async () => {
+    const info = await window.desktopAPI.pickWorkspace();
+    if (!info) return;
+    onWorkspaceChange(info);
+    setForm((current) => ({
+      ...current,
+      kiraWorkspaceRoot: info.root,
+      workspace: info.projectDir,
+    }));
+  };
 
   useEffect(() => {
     (window.desktopAPI as any).getRemoteStatus?.().then((s: any) => s && setRemote(s));
@@ -765,6 +805,30 @@ function SettingsPanel({ settings, onSave, onClose }: {
               >Light</button>
             </div>
           </label>
+
+          <div className="settings-section compact">
+            <div className="settings-section-header">
+              <span>Kira Workspace</span>
+            </div>
+            <div className="workspace-settings-grid">
+              <div>
+                <b>Workspace Root</b>
+                <code title={workspace?.root || form.kiraWorkspaceRoot}>{workspace?.root || form.kiraWorkspaceRoot || "Not set"}</code>
+                <button className="settings-mini-btn" onClick={pickRoot}>Choose Root</button>
+              </div>
+              <div>
+                <b>Project Directory</b>
+                <code title={workspace?.projectDir || form.workspace}>{workspace?.projectDir || form.workspace || "Not set"}</code>
+                <button className="settings-mini-btn" onClick={pickProject}>Choose Project</button>
+              </div>
+            </div>
+            {workspace && !workspace.isProjectInsideWorkspace && (
+              <span className="settings-note">This is an external project. Runtime assets, installs, downloads, logs, and backups stay in Kira Workspace.</span>
+            )}
+            {workspace?.isProjectInsideWorkspace && (
+              <span className="settings-note">New projects are recommended under Kira Workspace/projects. Runtime assets stay outside the project folder.</span>
+            )}
+          </div>
 
           <label className="settings-label">
             <span>Provider</span>

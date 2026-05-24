@@ -96,19 +96,19 @@ export async function executeComputerUse(input: ComputerUseInput, context: { cwd
     case "screenshot":
       return takeScreenshot(input, context.cwd);
     case "click":
-      await runMouseEvent("click", input);
+      await runMouseEvent("click", input, context.cwd);
       return `Clicked at (${input.x}, ${input.y}).`;
     case "double_click":
-      await runMouseEvent("double_click", input);
+      await runMouseEvent("double_click", input, context.cwd);
       return `Double-clicked at (${input.x}, ${input.y}).`;
     case "right_click":
-      await runMouseEvent("right_click", input);
+      await runMouseEvent("right_click", input, context.cwd);
       return `Right-clicked at (${input.x}, ${input.y}).`;
     case "move":
-      await runMouseEvent("move", input);
+      await runMouseEvent("move", input, context.cwd);
       return `Moved pointer to (${input.x}, ${input.y}).`;
     case "drag":
-      await runMouseEvent("drag", input);
+      await runMouseEvent("drag", input, context.cwd);
       return `Dragged from (${input.x}, ${input.y}) to (${input.toX}, ${input.toY}).`;
     case "type":
       await runAppleScript(`tell application "System Events" to keystroke ${quoteAppleScriptString(input.text ?? "")}`);
@@ -128,7 +128,7 @@ export function formatComputerUseResult(result: string): string {
 
 async function takeScreenshot(input: ComputerUseInput, cwd: string): Promise<string> {
   const format = input.format ?? "png";
-  const dir = path.join(cwd, ".kira-computer-use");
+  const dir = path.join(cwd, "artifacts", "screenshots");
   mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, `screen-${Date.now()}.${format}`);
   await execFileAsync("screencapture", ["-x", "-t", format, filePath], { timeout: 15_000 });
@@ -148,8 +148,8 @@ async function takeScreenshot(input: ComputerUseInput, cwd: string): Promise<str
   return lines.join("\n");
 }
 
-async function runMouseEvent(action: "click" | "double_click" | "right_click" | "move" | "drag", input: ComputerUseInput): Promise<void> {
-  const tempDir = path.join(os.tmpdir(), "kira-computer-use");
+async function runMouseEvent(action: "click" | "double_click" | "right_click" | "move" | "drag", input: ComputerUseInput, cwd: string): Promise<void> {
+  const tempDir = path.join(cwd, "tmp", "computer-use");
   mkdirSync(tempDir, { recursive: true });
   const scriptPath = path.join(tempDir, `${randomUUID()}.swift`);
   writeFileSync(scriptPath, mouseSwiftSource(), "utf8");

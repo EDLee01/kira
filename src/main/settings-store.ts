@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { MagiPaths } from "../core/paths.ts";
+import { defaultKiraWorkspaceRoot } from "../core/kira-workspace.ts";
 import { DesktopProviderKind, providerDefaults } from "./model-discovery";
 
 export type DesktopSettings = Record<string, string>;
@@ -29,6 +30,11 @@ export function applyDesktopSettingsToEnv(settings: DesktopSettings): void {
   if (settings.apiKey) process.env[defaults.apiKeyEnv] = settings.apiKey;
   if (settings.baseUrl) process.env[defaults.baseUrlEnv] = settings.baseUrl;
   if (settings.model) process.env[defaults.modelEnv] = settings.model;
+}
+
+export function readKiraWorkspaceRoot(paths: MagiPaths): string {
+  const settings = readDesktopSettings(paths);
+  return settings.kiraWorkspaceRoot || defaultKiraWorkspaceRoot();
 }
 
 function readProvider(value: string | undefined): DesktopProviderKind {

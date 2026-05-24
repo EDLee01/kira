@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import * as iconv from "iconv-lite";
 
 import { ToolError } from "./errors.ts";
 import { resolveWorkspacePathFrom } from "./workspace.ts";
+import { buildKiraWorkspaceEnv, ensureKiraWorkspace, isPathInside } from "../kira-workspace.ts";
 
 export interface ShellResult {
   command: string;
@@ -141,6 +142,7 @@ const FILE_MUTATION_COMMANDS = new Set([
 ]);
 
 const COMMAND_SEPARATORS = new Set([";", "&&", "||", "|"]);
+const LOCAL_NODE_INSTALL_COMMANDS = new Set(["install", "add", "i", "ci"]);
 const POWERSHELL_FILE_COMMANDS = new Set([
   "copy-item",
   "move-item",
@@ -175,13 +177,20 @@ const POWERSHELL_FILE_COMMANDS = new Set([
 export function findWorkspaceShellViolation(input: {
   cwd: string;
   command: string;
+  env?: NodeJS.ProcessEnv;
+  kiraWorkspaceRoot?: string;
 }): WorkspaceShellViolation | undefined {
+  const kiraWorkspaceRoot = input.kiraWorkspaceRoot ? ensureKiraWorkspace(input.kiraWorkspaceRoot).root : undefined;
+  const policyEnv = kiraWorkspaceRoot
+    ? buildKiraWorkspaceEnv({ root: kiraWorkspaceRoot, projectDir: input.cwd, env: input.env })
+    : input.env;
   return findWorkspaceShellViolationInternal({
     cwd: input.cwd,
     command: input.command,
     initialDir: input.cwd,
     depth: 0,
-    variables: createShellVariableMap(input.cwd)
+    variables: createShellVariableMap(input.cwd, policyEnv),
+    kiraWorkspaceRoot
   });
 }
 
@@ -191,6 +200,7 @@ function findWorkspaceShellViolationInternal(input: {
   initialDir: string;
   depth: number;
   variables: Map<string, string>;
+  kiraWorkspaceRoot?: string;
 }): WorkspaceShellViolation | undefined {
   const tokens = tokenizeShellCommand(input.command);
   let currentDir = input.initialDir;
@@ -218,7 +228,7 @@ function findWorkspaceShellViolationInternal(input: {
           reason: "output redirection target uses dynamic shell expansion and cannot be verified"
         };
       }
-      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath);
+      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath, input.kiraWorkspaceRoot);
       if (!resolved.ok) {
         return {
           command: "redirect",
@@ -238,7 +248,8 @@ function findWorkspaceShellViolationInternal(input: {
         command: nestedShellCommand.command,
         initialDir: currentDir,
         depth: input.depth + 1,
-        variables
+        variables,
+        kiraWorkspaceRoot: input.kiraWorkspaceRoot
       });
       if (violation) return violation;
       index = nestedShellCommand.index;
@@ -251,7 +262,8 @@ function findWorkspaceShellViolationInternal(input: {
         currentDir,
         command: commandName,
         code: inlineCode.code,
-        variables
+        variables,
+        kiraWorkspaceRoot: input.kiraWorkspaceRoot
       });
       if (violation) return violation;
       index = inlineCode.index;
@@ -272,7 +284,7 @@ function findWorkspaceShellViolationInternal(input: {
           reason: "cd target uses dynamic shell expansion and cannot be verified"
         };
       }
-      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath);
+      const resolved = resolveShellPath(input.cwd, currentDir, expandedPath, input.kiraWorkspaceRoot);
       if (!resolved.ok) {
         return { command: "cd", path: expandedPath, reason: "cd target is outside the workspace" };
       }
@@ -281,6 +293,16 @@ function findWorkspaceShellViolationInternal(input: {
       continue;
     }
 
+    const packageInstallViolation = findLocalNodePackageInstallViolation({
+      command: commandName,
+      tokens,
+      startIndex: index + 1,
+      currentDir,
+      kiraWorkspaceRoot: input.kiraWorkspaceRoot,
+      variables
+    });
+    if (packageInstallViolation) return packageInstallViolation;
+
     if (FILE_MUTATION_COMMANDS.has(commandName)) {
       const violation = findFileMutationViolation({
         cwd: input.cwd,
@@ -288,7 +310,8 @@ function findWorkspaceShellViolationInternal(input: {
         command: commandName,
         tokens,
         startIndex: index + 1,
-        variables
+        variables,
+        kiraWorkspaceRoot: input.kiraWorkspaceRoot
       });
       if (violation) return violation;
     }
@@ -304,6 +327,8 @@ export async function runShellCommand(input: {
   approveDangerous?: boolean;
   signal?: AbortSignal;
   skipAutoBackground?: boolean;
+  env?: NodeJS.ProcessEnv;
+  kiraWorkspaceRoot?: string;
 }): Promise<ShellResult> {
   if (isDangerousShellCommand(input.command) && !input.approveDangerous) {
     throw new ToolError(`Command requires explicit approval: ${input.command}`, "approval-required");
@@ -314,6 +339,11 @@ export async function runShellCommand(input: {
   }
 
   const isWindows = process.platform === "win32";
+  const runtimeEnv = buildShellEnv({
+    cwd: input.cwd,
+    env: input.env,
+    kiraWorkspaceRoot: input.kiraWorkspaceRoot
+  });
   if (!input.skipAutoBackground && isLongRunningCommand(input.command)) {
     if (isWindows) {
       return runWindowsBackgroundCommand(input);
@@ -322,14 +352,14 @@ export async function runShellCommand(input: {
   }
 
   return new Promise((resolve, reject) => {
-    const shellCmd = isWindows ? "cmd.exe" : "bash";
+    const shellCmd = isWindows ? "cmd.exe" : posixShellPath();
     // On Windows, prefix with `chcp 65001 >nul` to switch to UTF-8 codepage
     const winCommand = `chcp 65001 >nul && ${input.command}`;
     const shellArgs = isWindows ? ["/d", "/s", "/c", winCommand] : ["-lc", input.command];
     const child = spawn(shellCmd, shellArgs, {
       cwd: input.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: isWindows ? { ...process.env, PYTHONIOENCODING: "utf-8" } : process.env,
+      env: isWindows ? { ...runtimeEnv, PYTHONIOENCODING: "utf-8" } : runtimeEnv,
       detached: !isWindows,
       windowsHide: isWindows
     });
@@ -507,6 +537,7 @@ function findFileMutationViolation(input: {
   tokens: string[];
   startIndex: number;
   variables: Map<string, string>;
+  kiraWorkspaceRoot?: string;
 }): WorkspaceShellViolation | undefined {
   for (let index = input.startIndex; index < input.tokens.length; index++) {
     const token = input.tokens[index];
@@ -521,7 +552,7 @@ function findFileMutationViolation(input: {
           reason: `${input.command} path uses dynamic shell expansion and cannot be verified`
         };
       }
-      const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+      const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath, input.kiraWorkspaceRoot);
       if (!resolved.ok) {
         return {
           command: input.command,
@@ -545,13 +576,104 @@ function findFileMutationViolation(input: {
         reason: `${input.command} path uses dynamic shell expansion and cannot be verified`
       };
     }
-    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath, input.kiraWorkspaceRoot);
     if (!resolved.ok) {
       return {
         command: input.command,
         path: expandedPath,
         reason: `${input.command} path is outside the workspace`
       };
+    }
+  }
+  return undefined;
+}
+
+function findLocalNodePackageInstallViolation(input: {
+  command: string;
+  tokens: string[];
+  startIndex: number;
+  currentDir: string;
+  kiraWorkspaceRoot?: string;
+  variables: Map<string, string>;
+}): WorkspaceShellViolation | undefined {
+  if (!input.kiraWorkspaceRoot || !["npm", "pnpm", "yarn", "bun"].includes(input.command)) {
+    return undefined;
+  }
+  const endIndex = findCommandSegmentEnd(input.tokens, input.startIndex);
+  const rawArgs = input.tokens.slice(input.startIndex, endIndex);
+  const args = rawArgs.map((token) => token.toLowerCase());
+  if (input.command === "yarn" && firstNodePackageManagerSubcommand(args) === "global") {
+    return undefined;
+  }
+  const subcommand = firstNodePackageManagerSubcommand(args);
+  if (!subcommand || !LOCAL_NODE_INSTALL_COMMANDS.has(subcommand)) {
+    return undefined;
+  }
+  if (hasGlobalInstallFlag(args)) {
+    return undefined;
+  }
+  const targetDirToken = readNodePackageInstallTargetDir(rawArgs);
+  const expandedTargetDir = targetDirToken ? expandShellPathToken(targetDirToken, input.variables) : input.currentDir;
+  if (hasUnresolvedShellPathSyntax(expandedTargetDir)) {
+    return {
+      command: input.command,
+      path: expandedTargetDir,
+      reason: `${input.command} ${subcommand} target directory uses dynamic shell expansion and cannot be verified`
+    };
+  }
+  const targetDir = resolve(input.currentDir, expandedTargetDir);
+  if (isPathInside(input.kiraWorkspaceRoot, targetDir)) {
+    return undefined;
+  }
+  return {
+    command: input.command,
+    path: targetDir,
+    reason: `${input.command} ${subcommand} would create local package files outside Kira Workspace`
+  };
+}
+
+function firstNodePackageManagerSubcommand(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index];
+    if (COMMAND_SEPARATORS.has(token)) return undefined;
+    if (token === "--") return undefined;
+    if (token.startsWith("-")) {
+      if (nodePackageManagerOptionTakesValue(token)) index++;
+      continue;
+    }
+    return token;
+  }
+  return undefined;
+}
+
+function nodePackageManagerOptionTakesValue(token: string): boolean {
+  if (token.includes("=")) return false;
+  return [
+    "--prefix",
+    "--cache",
+    "--userconfig",
+    "--registry",
+    "--workspace",
+    "--filter",
+    "--dir",
+    "--cwd",
+    "-c",
+    "-w"
+  ].includes(token);
+}
+
+function hasGlobalInstallFlag(args: string[]): boolean {
+  return args.some((token) => token === "-g" || token === "--global" || token.startsWith("--global="));
+}
+
+function readNodePackageInstallTargetDir(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index];
+    const normalized = token.toLowerCase();
+    const inline = /^(--prefix|--dir|--cwd|--directory)=(.+)$/i.exec(token);
+    if (inline) return inline[2];
+    if (["--prefix", "--dir", "--cwd", "--directory", "-c", "-w"].includes(normalized)) {
+      return args[index + 1];
     }
   }
   return undefined;
@@ -587,13 +709,17 @@ function isDescriptorRedirect(token: string): boolean {
   return /^\d*>\&\d+$/.test(token) || /^\d*>\&-$/.test(token);
 }
 
-function resolveShellPath(cwd: string, baseDir: string, requestedPath: string):
+function resolveShellPath(cwd: string, baseDir: string, requestedPath: string, kiraWorkspaceRoot?: string):
   | { ok: true; absolutePath: string }
   | { ok: false } {
   try {
     return { ok: true, absolutePath: resolveWorkspacePathFrom(cwd, baseDir, requestedPath).absolutePath };
   } catch (error) {
     if (error instanceof ToolError && error.kind === "outside-workspace") {
+      const absolutePath = resolve(baseDir, requestedPath);
+      if (kiraWorkspaceRoot && isPathInside(kiraWorkspaceRoot, absolutePath)) {
+        return { ok: true, absolutePath };
+      }
       return { ok: false };
     }
     throw error;
@@ -743,6 +869,7 @@ function findInlineCodeViolation(input: {
   command: string;
   code: string;
   variables: Map<string, string>;
+  kiraWorkspaceRoot?: string;
 }): WorkspaceShellViolation | undefined {
   if (!inlineCodeMayMutate(input.code)) return undefined;
   const literals = extractPathLikeLiterals(input.code);
@@ -762,7 +889,7 @@ function findInlineCodeViolation(input: {
         reason: `${input.command} inline code uses dynamic shell expansion and cannot be verified`
       };
     }
-    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath);
+    const resolved = resolveShellPath(input.cwd, input.currentDir, expandedPath, input.kiraWorkspaceRoot);
     if (!resolved.ok) {
       return {
         command: input.command,
@@ -891,18 +1018,18 @@ function isPowerShellNamedParameter(token: string): boolean {
   return /^-[A-Za-z][A-Za-z0-9-]*$/.test(token);
 }
 
-function createShellVariableMap(cwd: string): Map<string, string> {
+function createShellVariableMap(cwd: string, env: NodeJS.ProcessEnv = process.env): Map<string, string> {
   const variables = new Map<string, string>();
-  for (const [key, value] of Object.entries(process.env)) {
+  for (const [key, value] of Object.entries(env)) {
     if (value !== undefined) variables.set(key, value);
   }
   variables.set("PWD", cwd);
   variables.set("OLDPWD", cwd);
-  if (process.env.HOME) variables.set("HOME", process.env.HOME);
-  if (process.env.USERPROFILE) variables.set("USERPROFILE", process.env.USERPROFILE);
-  if (process.env.TMPDIR) variables.set("TMPDIR", process.env.TMPDIR);
-  if (process.env.TEMP) variables.set("TEMP", process.env.TEMP);
-  if (process.env.TMP) variables.set("TMP", process.env.TMP);
+  if (env.HOME) variables.set("HOME", env.HOME);
+  if (env.USERPROFILE) variables.set("USERPROFILE", env.USERPROFILE);
+  if (env.TMPDIR) variables.set("TMPDIR", env.TMPDIR);
+  if (env.TEMP) variables.set("TEMP", env.TEMP);
+  if (env.TMP) variables.set("TMP", env.TMP);
   return variables;
 }
 
@@ -959,10 +1086,13 @@ async function runPosixBackgroundCommand(input: {
   approveDangerous?: boolean;
   signal?: AbortSignal;
   skipAutoBackground?: boolean;
+  env?: NodeJS.ProcessEnv;
+  kiraWorkspaceRoot?: string;
 }): Promise<ShellResult> {
-  const logFile = join(tmpdir(), `magi-desktop-bg-${Date.now()}.log`);
+  const runtimeRoot = input.kiraWorkspaceRoot ? ensureKiraWorkspace(input.kiraWorkspaceRoot).bashLogsRoot : tmpdir();
+  const logFile = join(runtimeRoot, `kira-bg-${Date.now()}.log`);
   const escaped = input.command.replace(/'/g, "'\\''");
-  const bgCommand = `nohup bash -c '${escaped}' > ${logFile} 2>&1 < /dev/null & disown; echo "BG_PID=$!"`;
+  const bgCommand = `nohup bash -c '${escaped}' > '${logFile.replace(/'/g, "'\\''")}' 2>&1 < /dev/null & disown; echo "BG_PID=$!"`;
   const bgResult = await runShellCommand({ ...input, command: bgCommand, skipAutoBackground: true });
   return {
     ...bgResult,
@@ -984,10 +1114,15 @@ async function runWindowsBackgroundCommand(input: {
   approveDangerous?: boolean;
   signal?: AbortSignal;
   skipAutoBackground?: boolean;
+  env?: NodeJS.ProcessEnv;
+  kiraWorkspaceRoot?: string;
 }): Promise<ShellResult> {
   const stamp = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const logFile = join(tmpdir(), `magi-desktop-bg-${stamp}.log`);
-  const scriptFile = join(tmpdir(), `magi-desktop-bg-${stamp}.cmd`);
+  const layout = input.kiraWorkspaceRoot ? ensureKiraWorkspace(input.kiraWorkspaceRoot) : undefined;
+  const runtimeRoot = layout?.bashLogsRoot ?? tmpdir();
+  const tempRoot = layout?.tmpRoot ?? tmpdir();
+  const logFile = join(runtimeRoot, `kira-bg-${stamp}.log`);
+  const scriptFile = join(tempRoot, `kira-bg-${stamp}.cmd`);
   writeFileSync(scriptFile, [
     "@echo off",
     "chcp 65001 >nul",
@@ -1020,6 +1155,25 @@ async function runWindowsBackgroundCommand(input: {
       `Wait 3-5 seconds before checking the log for the URL/port.\n` +
       bgResult.stdout,
   };
+}
+
+function buildShellEnv(input: {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  kiraWorkspaceRoot?: string;
+}): NodeJS.ProcessEnv {
+  if (!input.kiraWorkspaceRoot) {
+    return input.env ?? process.env;
+  }
+  return buildKiraWorkspaceEnv({
+    root: input.kiraWorkspaceRoot,
+    projectDir: input.cwd,
+    env: input.env
+  });
+}
+
+function posixShellPath(): string {
+  return existsSync("/bin/bash") ? "/bin/bash" : "bash";
 }
 
 function killWindowsProcessTree(pid: number | undefined): void {

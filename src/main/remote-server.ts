@@ -11,6 +11,7 @@ import { SessionStore } from "../core/session-store.ts";
 import { Engine } from "./engine";
 import { listCronJobs, applyCronUpdate, deleteCronJob, cronStorePathFromRoot } from "../core/tools/cron.ts";
 import { MagiPaths } from "../core/paths.ts";
+import { ensureKiraWorkspace } from "../core/kira-workspace.ts";
 import { getMobileUI } from "./remote-ui";
 
 export interface RemoteServerDeps {
@@ -133,11 +134,11 @@ function route(
     return;
   }
 
-  // File upload — saves to workspace's uploads/ subdirectory
+  // File upload — saves to Kira Workspace downloads/uploads instead of the project directory.
   if (pathname === "/api/upload" && method === "POST") {
     const filename = url.searchParams.get("name") || `upload-${Date.now()}`;
     const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const uploadDir = path.join(ctx.engine.cwd, "uploads");
+    const uploadDir = ensureKiraWorkspace(ctx.engine.kiraWorkspaceRoot).uploadsRoot;
     fs.mkdirSync(uploadDir, { recursive: true });
     const filePath = path.join(uploadDir, safeName);
     const stream = fs.createWriteStream(filePath);

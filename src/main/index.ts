@@ -5,15 +5,21 @@ import { startScheduler } from "./scheduler";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
 import { buildDesktopProvider } from "./desktop-provider";
-import { readDesktopSettings } from "./settings-store";
+import { readDesktopSettings, readKiraWorkspaceRoot } from "./settings-store";
+import { buildKiraWorkspaceInfo, defaultProjectDir } from "../core/kira-workspace.ts";
 
 let mainWindow: BrowserWindow | null = null;
 let stopScheduler: (() => void) | null = null;
 
 function readSchedulerWorkspace(): string {
   const paths = getMagiPaths(process.env);
-  const workspace = readDesktopSettings(paths).workspace;
-  return workspace || process.cwd();
+  const settings = readDesktopSettings(paths);
+  const root = readKiraWorkspaceRoot(paths);
+  return buildKiraWorkspaceInfo(root, settings.workspace || defaultProjectDir(root)).projectDir;
+}
+
+function readSchedulerWorkspaceRoot(): string {
+  return readKiraWorkspaceRoot(getMagiPaths(process.env));
 }
 
 function createWindow(): void {
@@ -47,6 +53,7 @@ function createWindow(): void {
     win: mainWindow,
     getProvider: () => buildDesktopProvider(paths),
     getWorkspace: readSchedulerWorkspace,
+    getKiraWorkspaceRoot: readSchedulerWorkspaceRoot,
   });
 
   if (process.env.NODE_ENV === "development") {
