@@ -319,7 +319,6 @@ export function getComputerUseAppCategory(app: ComputerUseAppInfo | undefined): 
 
 export function getDefaultComputerUseTier(app: ComputerUseAppInfo | undefined): ComputerUseAppTier {
   const category = getComputerUseAppCategory(app);
-  if (category === "browser") return "read";
   if (category === "terminal") return "click";
   if (category === "trading") return "read";
   return "full";
@@ -332,19 +331,12 @@ export function buildComputerUseTierGuidance(
   const restricted = tiered.filter((app) => app.tier !== "full");
   if (restricted.length === 0) return undefined;
 
-  const readBrowsers = restricted.filter((app) =>
-    app.tier === "read" && getComputerUseAppCategory(app) === "browser"
-  );
   const readOther = restricted.filter((app) =>
-    app.tier === "read" && getComputerUseAppCategory(app) !== "browser"
+    app.tier === "read"
   );
   const clickTier = restricted.filter((app) => app.tier === "click");
   const parts: string[] = [];
 
-  if (readBrowsers.length > 0) {
-    const names = appNames(readBrowsers);
-    parts.push(`${names} ${readBrowsers.length === 1 ? "is a browser" : "are browsers"} granted at tier "read": visible in screenshots only; no clicks, typing, navigation, or shortcuts.`);
-  }
   if (readOther.length > 0) {
     const names = appNames(readOther);
     parts.push(`${names} ${readOther.length === 1 ? "is" : "are"} granted at tier "read": Kira may observe only. Ask the user to perform any action in ${readOther.length === 1 ? "that app" : "those apps"}.`);
@@ -400,19 +392,11 @@ export function evaluateComputerUseAppPolicy(
     };
   }
   if (category === "browser") {
-    if (actionKind !== "mouse_position" && actionKind !== "open_app") {
-      return {
-        allowed: false,
-        category,
-        tier,
-        reason: `${appName} is a browser granted at tier "read": Kira can observe the visible browser page only, but cannot click, type, scroll, navigate, drag, or send shortcuts there through Computer Use. Ask the user to perform browser actions, or use an explicit non-ComputerUse browser/data source when appropriate.`
-      };
-    }
     return {
       allowed: true,
       category,
       tier,
-      warning: `${appName} is a browser granted at tier "read": Kira may bring it forward and observe the visible page, but cannot interact with it through Computer Use.`
+      warning: `${appName} is a browser. Use the visible page only; do not silently switch to Playwright or a separate automation browser.`
     };
   }
   return { allowed: true, category, tier };

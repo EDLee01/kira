@@ -27,10 +27,10 @@ function createWindow(): void {
     ? path.join(process.resourcesPath, "build", process.platform === "win32" ? "icon.ico" : "icon.png")
     : path.join(__dirname, "..", "..", "build", process.platform === "win32" ? "icon.ico" : "icon.png");
   mainWindow = new BrowserWindow({
-    width: 480,
-    height: 860,
-    minWidth: 380,
-    minHeight: 600,
+    width: 1280,
+    height: 840,
+    minWidth: 760,
+    minHeight: 560,
     title: "Kira",
     icon: appIcon,
     backgroundColor: "#0a0a0f",

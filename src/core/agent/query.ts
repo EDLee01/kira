@@ -71,6 +71,7 @@ export interface AgentQueryInput {
   cwd: string;
   env?: NodeJS.ProcessEnv;
   stateRoot?: string;
+  memoryRoot?: string;
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   webSearchConfig?: WebSearchConfig;
@@ -512,6 +513,7 @@ async function executePreparedToolUses(
       userIntent: latestUserText(input.messages),
       disabledToolNames: [...disabledBuiltinTools],
       stateRoot: input.stateRoot,
+      memoryRoot: input.memoryRoot,
       outputRoot: input.outputRoot,
       kiraWorkspaceRoot: input.kiraWorkspaceRoot,
       sessionId: input.sessionId,

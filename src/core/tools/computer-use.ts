@@ -236,6 +236,10 @@ export interface ComputerUseApprovalResponse {
   grantedApps?: string[];
   deniedApps?: string[];
   flags?: Partial<ComputerUseGrantFlags>;
+  tccState?: {
+    accessibility: boolean;
+    screenRecording: boolean;
+  };
   userConsented?: boolean;
 }
 
@@ -1540,11 +1544,7 @@ function enforceGrantTier(
   }
   if (actionKind === "open_app") return grant;
   if (grant.tier === "read" && actionKind !== "mouse_position") {
-    const category = getComputerUseAppCategory(app);
-    const guidance = category === "browser"
-      ? " Kira can observe the visible browser page, but cannot click, type, scroll, navigate, or send shortcuts there through Computer Use. Use the user's visible browser only for observation; if interaction is required, ask the user to perform it or use an explicit non-ComputerUse browser/data source when appropriate."
-      : " Kira can observe this app only. Ask the user to perform any actions in this app themselves.";
-    throw new ToolError(`${observedAppPrefix(role, app)} is granted at read tier only.${guidance}${TIER_ANTI_SUBVERSION}`, "approval-required");
+    throw new ToolError(`${observedAppPrefix(role, app)} is granted at read tier only. Kira can observe this app only. Ask the user to perform any actions in this app themselves.${TIER_ANTI_SUBVERSION}`, "approval-required");
   }
   if (grant.tier === "click" && (actionKind === "keyboard" || actionKind === "mouse_full")) {
     throw new ToolError(`${observedAppPrefix(role, app)} is granted at click tier. Kira may move, scroll, or plain-click, but cannot type, drag, right-click, or send shortcuts there.${TIER_ANTI_SUBVERSION}`, "approval-required");

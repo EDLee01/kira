@@ -39,6 +39,7 @@ export async function executeBuiltinAgentTool(input: {
   userIntent?: string;
   disabledToolNames?: string[];
   stateRoot?: string;
+  memoryRoot?: string;
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   sessionId?: string;
@@ -63,6 +64,7 @@ export async function executeBuiltinAgentTool(input: {
     userIntent: input.userIntent,
     disabledToolNames: input.disabledToolNames,
     stateRoot: input.stateRoot,
+    memoryRoot: input.memoryRoot,
     outputRoot: input.outputRoot,
     kiraWorkspaceRoot: input.kiraWorkspaceRoot,
     sessionId: input.sessionId,
@@ -89,6 +91,7 @@ export async function executeBuiltinAgentTools(input: {
   userIntent?: string;
   disabledToolNames?: string[];
   stateRoot?: string;
+  memoryRoot?: string;
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   sessionId?: string;
@@ -113,6 +116,7 @@ export async function executeBuiltinAgentTools(input: {
     userIntent: input.userIntent,
     disabledToolNames: input.disabledToolNames,
     stateRoot: input.stateRoot,
+    memoryRoot: input.memoryRoot,
     outputRoot: input.outputRoot,
     kiraWorkspaceRoot: input.kiraWorkspaceRoot,
     sessionId: input.sessionId,

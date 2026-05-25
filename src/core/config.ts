@@ -74,6 +74,7 @@ export interface ContextConfig {
 
 export interface MemoryConfig {
   enabled: boolean;
+  root?: string;
   autoWrite: "off" | "explicit";
   maxResults: number;
   scopes: Array<"user" | "project" | "session">;
@@ -545,6 +546,7 @@ function readWebSearchConfig(
 function readMemoryConfig(value: Record<string, unknown>, configFile: string): MemoryConfig {
   return {
     enabled: readOptionalBoolean(value.enabled, "memory.enabled", configFile) ?? true,
+    root: readOptionalString(value.root, "memory.root", configFile),
     autoWrite: readMemoryAutoWrite(value.autoWrite, "memory.autoWrite", configFile),
     maxResults: readOptionalPositiveInteger(value.maxResults, "memory.maxResults", configFile) ?? 8,
     scopes: readMemoryScopes(value.scopes, "memory.scopes", configFile),

@@ -77,7 +77,8 @@ import {
   parseComputerUseInput
 } from "./computer-use.ts";
 import { executeSkillTool, parseSkillToolInput, SkillToolInputSchema } from "./skill-tool.ts";
-import { writeMemdirEntry, MemdirType } from "../memdir.ts";
+import { MemdirType } from "../memdir.ts";
+import { proposeMemoryDraft } from "../memory-draft.ts";
 import { formatTodoWriteResult, parseTodoWriteInput, replaceTodoList, TodoWriteInputSchema } from "./todo.ts";
 import { executeToolSearch, parseToolSearchInput, ToolSearchInputSchema } from "./tool-search.ts";
 import {
@@ -225,7 +226,6 @@ function isIdempotentComputerUseAccessRequest(
   context: Pick<ToolExecutionContext, "cwd" | "kiraWorkspaceRoot" | "sessionId">
 ): boolean {
   if (!Array.isArray(input.apps) || input.apps.length === 0) return false;
-  if (input.clipboardRead === true || input.clipboardWrite === true || input.systemKeyCombos === true) return false;
   const requested = input.apps.filter((app): app is string => typeof app === "string");
   if (requested.length !== input.apps.length) return false;
   const state = getComputerUseSessionState({
@@ -233,6 +233,9 @@ function isIdempotentComputerUseAccessRequest(
     kiraWorkspaceRoot: context.kiraWorkspaceRoot,
     sessionId: context.sessionId
   });
+  if (input.clipboardRead === true && !state.flags.clipboardRead) return false;
+  if (input.clipboardWrite === true && !state.flags.clipboardWrite) return false;
+  if (input.systemKeyCombos === true && !state.flags.systemKeyCombos) return false;
   const grants = state.grants.map((grant) => [
     ...computerUseApprovalKeysForValue(grant.bundleId),
     ...computerUseApprovalKeysForValue(grant.displayName)
@@ -291,6 +294,7 @@ export interface ToolExecutionContext {
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   stateRoot?: string;
+  memoryRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
   promptModel?: (request: { messages: MagiMessage[] }) => Promise<{ text: string }>;
@@ -424,6 +428,7 @@ export async function executeRegisteredTool(input: {
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   stateRoot?: string;
+  memoryRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
   promptModel?: (request: { messages: MagiMessage[] }) => Promise<{ text: string }>;
@@ -456,6 +461,7 @@ export async function executeRegisteredTool(input: {
       outputRoot: input.outputRoot,
       kiraWorkspaceRoot: input.kiraWorkspaceRoot,
       stateRoot: input.stateRoot,
+      memoryRoot: input.memoryRoot,
       sessionId: input.sessionId,
       webSearchConfig: input.webSearchConfig,
       promptModel: input.promptModel,
@@ -544,6 +550,7 @@ export async function executeRegisteredTools(input: {
   outputRoot?: string;
   kiraWorkspaceRoot?: string;
   stateRoot?: string;
+  memoryRoot?: string;
   sessionId?: string;
   webSearchConfig?: WebSearchConfig;
   promptModel?: (request: { messages: MagiMessage[] }) => Promise<{ text: string }>;
@@ -811,10 +818,7 @@ function checkComputerUseToolPermission(
     return undefined;
   }
   if (input.action === "request_access") {
-    if (isIdempotentComputerUseAccessRequest(input, context)) {
-      return { decision: "allow", reason: "ComputerUse access was already granted for this session" };
-    }
-    return { decision: "ask", reason: "ComputerUse is requesting permission to control selected desktop apps" };
+    return { decision: "allow", reason: "ComputerUse access is managed by Mac Permissions setup and session app policy" };
   }
   if (input.action === "request_teach_access") {
     return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };
@@ -829,13 +833,13 @@ const COMPUTER_USE_COMPAT_TOOLS: RegisteredTool[] = [
   computerUseCompatTool({
     name: "request_access",
     action: "request_access",
-    description: "Request user permission to control a set of applications for this session. Must be called before any other tool in this server. The user sees a single dialog listing all requested apps and either allows the whole set or denies it. Call this again mid-session to add more apps; previously granted apps remain granted. Returns the granted apps, denied apps, and screenshot filtering capability.",
+    description: "Request user permission to control a set of applications for this session. Call this only when the app is not already listed by list_granted_apps, or when adding grant flags such as clipboardWrite or systemKeyCombos. The user sees a dialog listing requested apps and optional flags; previously granted apps remain granted. Returns the granted apps, denied apps, and screenshot filtering capability.",
     inputSchema: computerUseSchema({
       apps: { type: "array", items: { type: "string" }, description: 'Application display names (e.g. "Slack", "Calendar") or bundle identifiers (e.g. "com.tinyspeck.slackmacgap"). Display names are resolved case-insensitively against installed apps.' },
       reason: { type: "string", description: "One-sentence explanation shown to the user in the approval dialog. Explain the task, not the mechanism." },
       clipboardRead: { type: "boolean", description: "Also request permission to read the user's clipboard (separate checkbox in the dialog)." },
       clipboardWrite: { type: "boolean", description: "Also request permission to write the user's clipboard. When granted, multi-line `type` calls use the clipboard fast path." },
-      systemKeyCombos: { type: "boolean", description: "Also request permission to send system-level key combos (quit app, switch app, lock screen). Without this, those specific combos are blocked." }
+      systemKeyCombos: { type: "boolean", description: "Also request permission to send system-level key combos (quit app, switch app, lock screen, Spotlight, app switching). Browser address-bar shortcuts such as command+l do not need this flag." }
     }, ["apps", "reason"])
   }),
   computerUseCompatTool({
@@ -1903,7 +1907,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "Memorize",
-    description: "Save a durable memory (memdir entry) for future conversations. Use sparingly for genuine user preferences, project facts, corrections, or reference pointers — not for ephemeral conversation state.",
+    description: "Propose a Memory Draft for future conversations. Use sparingly for genuine user preferences, project facts, corrections, or reference pointers — not for ephemeral conversation state. This does not write formal Memory until the user applies the draft.",
     category: "memory",
     tags: ["memory", "memdir", "persist"],
     inputSchema: {
@@ -1935,15 +1939,16 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
       if (!context.stateRoot) {
         throw new Error("Memorize requires Magi stateRoot");
       }
-      const root = path.dirname(context.stateRoot);
-      const entry = writeMemdirEntry({
-        paths: { root },
-        type,
-        name,
-        description,
-        body
+      const appRoot = path.dirname(context.stateRoot);
+      const draft = proposeMemoryDraft({
+        appRoot,
+        root: context.memoryRoot,
+        targetFile: memoryTargetFile(type),
+        content: formatProposedMemory({ name, description, body, type }),
+        reason: `Memorize tool proposed ${type} Memory: ${description}`,
+        sourceSession: context.sessionId
       });
-      return `Saved memory: ${entry.filename} (type=${entry.type})`;
+      return `Created Memory Draft: ${draft.id} -> ${draft.targetFile}. It will not change formal Memory until the user applies it.`;
     },
     isReadOnly: () => false,
     isDestructive: () => false,
@@ -2195,7 +2200,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "ComputerUse",
-    description: "Observe and control the visible desktop. Actions: screenshot, zoom, display_info, switch_display, permissions, cursor_position, frontmost_app, app_under_point, request_access, request_teach_access, list_granted_apps, list_running_apps, list_installed_apps, open_app, click, double_click, triple_click, right_click, middle_click, move, drag, left_mouse_down, left_mouse_up, scroll, type, key, hold_key, hotkey, read_clipboard, write_clipboard, wait, batch, teach_step, teach_batch. macOS Screen Recording and Accessibility are first-run setup items in Kira Settings; do not repeatedly ask for OS permissions during a task if the user says they are granted. Call request_access with target apps and reason before controlling apps. Use request_teach_access plus teach_step/teach_batch when the user wants to learn or be guided. Use display_info and switch_display for multi-monitor work. Use screenshot first to inspect the screen, then zoom to inspect small text. Use left_mouse_down/up for held-button interactions after moving the pointer. Batch coordinates refer to the same pre-batch screenshot.",
+    description: "Observe and control the visible desktop. Actions: screenshot, zoom, display_info, switch_display, permissions, cursor_position, frontmost_app, app_under_point, request_access, request_teach_access, list_granted_apps, list_running_apps, list_installed_apps, open_app, click, double_click, triple_click, right_click, middle_click, move, drag, left_mouse_down, left_mouse_up, scroll, type, key, hold_key, hotkey, read_clipboard, write_clipboard, wait, batch, teach_step, teach_batch. macOS Screen Recording and Accessibility are first-run setup items in Kira Settings; do not repeatedly ask for OS permissions during a task if the user says they are granted. Call request_access only for apps not already in list_granted_apps, or to add missing grant flags. Use request_teach_access plus teach_step/teach_batch when the user wants to learn or be guided. Use display_info and switch_display for multi-monitor work. Use screenshot first to inspect the screen, then zoom to inspect small text. Use left_mouse_down/up for held-button interactions after moving the pointer. Batch coordinates refer to the same pre-batch screenshot.",
     category: "system",
     tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos", "windows"],
     inputSchema: ComputerUseInputSchema,
@@ -2224,10 +2229,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         return undefined;
       }
       if (input.action === "request_access") {
-        if (isIdempotentComputerUseAccessRequest(input, context)) {
-          return { decision: "allow", reason: "ComputerUse access was already granted for this session" };
-        }
-        return { decision: "ask", reason: "ComputerUse is requesting permission to control selected desktop apps" };
+        return { decision: "allow", reason: "ComputerUse access is managed by Mac Permissions setup and session app policy" };
       }
       if (input.action === "request_teach_access") {
         return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };
@@ -2794,7 +2796,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         ? (input as Record<string, number>).timeoutMs
         : 2500;
       // Discover via mDNS (stubbed for desktop — no peer discovery)
-      const peers: Array<{ name: string; host: string; port: number; txt: Record<string, string> }> = [];
+      const peers: Array<{ instanceName: string; address: string; hostname: string; port: number; txt: Record<string, string> }> = [];
       // Also include saved peers (manually configured with credentials)
       // Note: we read from a stand-alone SessionStore; saved peers are stored as
       // mcp_oauth_tokens with serverName starting with "peer:".
@@ -3345,4 +3347,22 @@ function requireSkillsRoot(context: ToolExecutionContext): string {
 
 function isValidMemdirType(value: string): value is MemdirType {
   return value === "user" || value === "feedback" || value === "project" || value === "reference";
+}
+
+function memoryTargetFile(type: MemdirType): string {
+  if (type === "user") return "user.md";
+  if (type === "feedback") return "preferences.md";
+  if (type === "project") return "projects/default.md";
+  return "workflows/README.md";
+}
+
+function formatProposedMemory(input: { type: MemdirType; name: string; description: string; body: string }): string {
+  return [
+    `## ${input.name}`,
+    "",
+    `Type: ${input.type}`,
+    `Description: ${input.description}`,
+    "",
+    input.body
+  ].join("\n");
 }

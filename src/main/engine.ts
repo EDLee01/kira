@@ -5,13 +5,14 @@
 import { BrowserWindow } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
 import { MagiContentPart, textMessage } from "../core/providers/ir.ts";
-import { McpServerConfig } from "../core/config.ts";
+import { loadConfig, McpServerConfig } from "../core/config.ts";
 import { getMagiPaths, MagiPaths } from "../core/paths.ts";
 import { SessionStore } from "../core/session-store.ts";
 import { compactSession, recoverSessionContext } from "../core/context/compaction.ts";
 import { buildLayeredContext } from "../core/context/layers.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
 import { buildSystemInstructions } from "../core/agent/system-prompt.ts";
+import { formatMemoryContext, retrieveRelevantMemory } from "../core/memory-search.ts";
 import { getBuiltinToolDefinitions } from "../core/tools/registry.ts";
 import { executeComputerUse, previewComputerUseApproval, releaseComputerUseSession, resetComputerUseTurnState, restoreComputerUseClipboard, restoreComputerUseHiddenApps } from "../core/tools/computer-use.ts";
 import type { ComputerUseTeachStepRequest } from "../core/tools/computer-use.ts";
@@ -138,6 +139,8 @@ export class Engine {
       // Build messages: prepend summary if exists, then recent messages
       const messages: any[] = [];
       const goalContext = formatGoalContext(getGoal(paths, sessionId));
+      const durableMemoryContext = this.buildDurableMemoryContext(paths, userMessage, sessionId);
+      const memoryContext = [goalContext, durableMemoryContext].filter(Boolean).join("\n\n") || undefined;
       const { systemPrompt } = buildLayeredContext({
         cwd: this._cwd,
         paths,
@@ -146,7 +149,7 @@ export class Engine {
           platform: process.platform,
           toolCount: getBuiltinToolDefinitions().filter((tool) => tool.name !== "Browser").length
         }),
-        memoryContext: goalContext || undefined,
+        memoryContext,
         includeGit: true,
         includeDate: true,
         platform: process.platform
@@ -186,6 +189,7 @@ export class Engine {
         cwd: this._cwd,
         env: workspaceEnv,
         stateRoot: paths.stateRoot,
+        memoryRoot: loadConfig(paths).memory.root,
         outputRoot: ensureKiraWorkspace(this._kiraWorkspaceRoot).artifactsRoot,
         kiraWorkspaceRoot: this._kiraWorkspaceRoot,
         computerUseDeniedBundleIds: parseStringArraySetting(settings.computerUseDeniedBundleIds),
@@ -386,6 +390,25 @@ export class Engine {
     if (this.win.isDestroyed()) return;
     this.win.show();
     this.win.focus();
+  }
+
+  private buildDurableMemoryContext(paths: MagiPaths, userMessage: string, sessionId: string): string {
+    try {
+      const config = loadConfig(paths);
+      if (!config.memory.enabled) {
+        return "";
+      }
+      const hits = retrieveRelevantMemory({
+        appRoot: paths.root,
+        root: config.memory.root,
+        query: userMessage,
+        maxResults: config.memory.maxResults,
+        sessionId
+      });
+      return formatMemoryContext(hits);
+    } catch {
+      return "";
+    }
   }
 
   private async computerUseApprovalPreview(input: Record<string, unknown>) {
