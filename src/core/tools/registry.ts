@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -65,9 +66,14 @@ import { sshExec } from "../ssh/exec.ts";
 import { sshFileRead, sshFileWrite } from "../ssh/file.ts";
 import { executeSnip, formatSnipResult, parseSnipInput, SnipInputSchema } from "./snip.ts";
 import {
+  type ComputerUseContext,
+  type ComputerUseApprovalResponse,
   ComputerUseInputSchema,
+  ComputerUseTeachStepResolver,
   executeComputerUse,
   formatComputerUseResult,
+  getComputerUseSessionState,
+  isComputerUseReadOnlyAction,
   parseComputerUseInput
 } from "./computer-use.ts";
 import { executeSkillTool, parseSkillToolInput, SkillToolInputSchema } from "./skill-tool.ts";
@@ -153,6 +159,9 @@ import {
   UserQuestionResolver
 } from "./user-question.ts";
 import { readWebFetchAllowlist, webFetch, webFetchHostAllowed } from "./web-fetch.ts";
+import { filterComputerUseAppsForDescription } from "./computer-use-app-names.ts";
+import { listInstalledAppsForDescription } from "./computer-use-installed-apps.ts";
+import { callComputerUseHelperIfReady } from "./computer-use-runtime.ts";
 import { BrowserActionInputSchema, executeBrowserAction, formatBrowserActionResult } from "./browser.ts";
 import {
   executeWebBrowser,
@@ -174,6 +183,14 @@ import {
 } from "./workspace-diagnostics.ts";
 import { resolveWorkspacePath } from "./workspace.ts";
 import { WebSearchConfig } from "../config.ts";
+
+export type { ComputerUseTeachStepResolver } from "./computer-use.ts";
+export type { ComputerUseContext } from "./computer-use.ts";
+
+export type ToolApprovalDecision = boolean | {
+  approved: boolean;
+  computerUse?: ComputerUseApprovalResponse;
+};
 
 export type ToolPermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "auto";
 export type ToolPermissionDecision = "allow" | "ask" | "deny";
@@ -201,6 +218,52 @@ export interface RegisteredTool {
   isDestructive(input: Record<string, unknown>): boolean;
   isConcurrencySafe(input: Record<string, unknown>): boolean;
   checkPermissions?(input: Record<string, unknown>, context: ToolExecutionContext): ToolPermissionResult | undefined;
+}
+
+function isIdempotentComputerUseAccessRequest(
+  input: Record<string, unknown>,
+  context: Pick<ToolExecutionContext, "cwd" | "kiraWorkspaceRoot" | "sessionId">
+): boolean {
+  if (!Array.isArray(input.apps) || input.apps.length === 0) return false;
+  if (input.clipboardRead === true || input.clipboardWrite === true || input.systemKeyCombos === true) return false;
+  const requested = input.apps.filter((app): app is string => typeof app === "string");
+  if (requested.length !== input.apps.length) return false;
+  const state = getComputerUseSessionState({
+    cwd: context.cwd,
+    kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+    sessionId: context.sessionId
+  });
+  const grants = state.grants.map((grant) => [
+    ...computerUseApprovalKeysForValue(grant.bundleId),
+    ...computerUseApprovalKeysForValue(grant.displayName)
+  ]);
+  return requested.every((app) => {
+    const requestedKeys = computerUseApprovalKeysForValue(app);
+    return grants.some((grantKeys) => grantKeys.some((grantKey) => requestedKeys.has(grantKey)));
+  });
+}
+
+function computerUseApprovalKeysForValue(value: string | undefined): Set<string> {
+  if (!value) return new Set();
+  const normalized = value.trim().toLowerCase();
+  const keys = new Set([normalized]);
+  if (normalized === "com.apple.safari" || normalized === "safari" || normalized === "safari浏览器") {
+    keys.add("com.apple.safari");
+    keys.add("safari");
+    keys.add("safari浏览器");
+  }
+  if (normalized === "com.apple.finder" || normalized === "finder" || normalized === "访达") {
+    keys.add("com.apple.finder");
+    keys.add("finder");
+    keys.add("访达");
+  }
+  if (normalized === "explorer.exe" || normalized === "explorer" || normalized === "file explorer" || normalized === "windows explorer") {
+    keys.add("explorer.exe");
+    keys.add("explorer");
+    keys.add("file explorer");
+    keys.add("windows explorer");
+  }
+  return keys;
 }
 
 export interface SubAgentRequest {
@@ -235,6 +298,13 @@ export interface ToolExecutionContext {
   userMessageSink?: UserMessageSink;
   toolUse?: MagiToolUsePart;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
+  signal?: AbortSignal;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseApprovalResponse?: ComputerUseApprovalResponse;
+  computerUseDeniedBundleIds?: string[];
 }
 
 export interface RegisteredToolResult {
@@ -245,16 +315,102 @@ export interface RegisteredToolResult {
   permission?: ToolPermissionResult;
 }
 
+export interface BuiltinToolDefinitionOptions {
+  computerUseInstalledAppNames?: readonly string[];
+}
+
+export interface ComputerUseToolDefinitionContext {
+  cwd: string;
+  kiraWorkspaceRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
+}
+
 export function getBuiltinToolRegistry(): Map<string, RegisteredTool> {
   return new Map(BUILTIN_TOOLS.map((tool) => [tool.name, tool]));
 }
 
-export function getBuiltinToolDefinitions(): MagiToolDefinition[] {
-  return BUILTIN_TOOLS.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema
-  }));
+const MODEL_HIDDEN_BUILTIN_TOOLS = new Set([
+  "Browser",
+  "ComputerUse",
+  "display_info",
+  "permissions",
+  "frontmost_app",
+  "app_under_point",
+  "list_running_applications",
+  "list_installed_applications"
+]);
+
+export function getBuiltinToolDefinitions(options: BuiltinToolDefinitionOptions = {}): MagiToolDefinition[] {
+  return BUILTIN_TOOLS
+    .filter((tool) => !MODEL_HIDDEN_BUILTIN_TOOLS.has(tool.name))
+    .map((tool) => withComputerUseInstalledAppsHint({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema
+    }, options.computerUseInstalledAppNames));
+}
+
+let installedAppNamesPromise: Promise<string[] | undefined> | undefined;
+let installedAppNamesRetryAt = 0;
+
+export function getComputerUseInstalledAppNamesHint(
+  context: ComputerUseToolDefinitionContext
+): Promise<string[] | undefined> {
+  if (!installedAppNamesPromise || Date.now() >= installedAppNamesRetryAt) {
+    installedAppNamesPromise = loadComputerUseInstalledAppNamesHint(context).then((names) => {
+      installedAppNamesRetryAt = names?.length ? Number.POSITIVE_INFINITY : Date.now() + 30_000;
+      return names;
+    });
+  }
+  return installedAppNamesPromise;
+}
+
+async function loadComputerUseInstalledAppNamesHint(
+  context: ComputerUseToolDefinitionContext
+): Promise<string[] | undefined> {
+  const directInstalled = await listInstalledAppsForDescription(1_000);
+  const installed = directInstalled?.length ? directInstalled : await callComputerUseHelperIfReady<Array<{ bundleId: string; displayName: string; path?: string }>>({
+    command: "list_installed_apps",
+    payload: {},
+    cwd: context.cwd,
+    kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+    env: context.env,
+    signal: context.signal,
+    timeoutMs: 1_000
+  });
+  if (!installed?.length) return undefined;
+  const names = filterComputerUseAppsForDescription(installed, os.homedir());
+  return names.length > 0 ? names : undefined;
+}
+
+function withComputerUseInstalledAppsHint(
+  tool: MagiToolDefinition,
+  installedAppNames: readonly string[] | undefined
+): MagiToolDefinition {
+  if (!installedAppNames?.length) return tool;
+  if (tool.name !== "request_access" && tool.name !== "request_teach_access") return tool;
+
+  const inputSchema = cloneRecord(tool.inputSchema);
+  const properties = isRecord(inputSchema.properties) ? cloneRecord(inputSchema.properties) : undefined;
+  const apps = properties && isRecord(properties.apps) ? cloneRecord(properties.apps) : undefined;
+  if (!properties || !apps || typeof apps.description !== "string") return tool;
+
+  const installedAppsHint = ` Available applications on this machine: ${installedAppNames.join(", ")}.`;
+  apps.description = apps.description.includes("Available applications on this machine:")
+    ? apps.description
+    : `${apps.description}${installedAppsHint}`;
+  properties.apps = apps;
+  inputSchema.properties = properties;
+  return { ...tool, inputSchema };
+}
+
+function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
+  return { ...value };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export async function executeRegisteredTool(input: {
@@ -274,7 +430,13 @@ export async function executeRegisteredTool(input: {
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
-  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: ToolPermissionResult }) => Promise<boolean> | boolean;
+  signal?: AbortSignal;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseDeniedBundleIds?: string[];
+  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: ToolPermissionResult }) => Promise<ToolApprovalDecision> | ToolApprovalDecision;
 }): Promise<RegisteredToolResult> {
   const registry = getBuiltinToolRegistry();
   const tool = registry.get(input.toolUse.name);
@@ -300,7 +462,13 @@ export async function executeRegisteredTool(input: {
       userQuestionResolver: input.userQuestionResolver,
       userMessageSink: input.userMessageSink,
       toolUse: input.toolUse,
-      spawnSubAgent: input.spawnSubAgent
+      spawnSubAgent: input.spawnSubAgent,
+      signal: input.signal,
+      computerUseTeachStepResolver: input.computerUseTeachStepResolver,
+      computerUseHideHostWindow: input.computerUseHideHostWindow,
+      computerUseTeachModeActivated: input.computerUseTeachModeActivated,
+      computerUseTeachModeExited: input.computerUseTeachModeExited,
+      computerUseDeniedBundleIds: input.computerUseDeniedBundleIds
     };
     const permission = checkToolPermission({
       toolUse: input.toolUse,
@@ -310,7 +478,8 @@ export async function executeRegisteredTool(input: {
       tool,
       env: context.env,
       userIntent: context.userIntent,
-      kiraWorkspaceRoot: context.kiraWorkspaceRoot
+      kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+      sessionId: context.sessionId
     });
     // Generate diff preview for FileWrite/FileEdit when approval is needed
     if (permission.decision === "ask" && (input.toolUse.name === "FileWrite" || input.toolUse.name === "FileEdit")) {
@@ -334,14 +503,20 @@ export async function executeRegisteredTool(input: {
     }
     const approvalPermission = permission.decision === "ask" ? permission : undefined;
     if (permission.decision === "ask") {
-      const approved = await input.approvalResolver?.({ toolUse: input.toolUse, permission });
+      const approval = await input.approvalResolver?.({ toolUse: input.toolUse, permission });
+      const approved = typeof approval === "boolean" ? approval : approval?.approved;
+      if (approval && typeof approval !== "boolean") {
+        context.computerUseApprovalResponse = approval.computerUse;
+      }
       if (!approved) {
         return errorResult(input.toolUse, `Permission ask: ${permission.reason}`, permission);
       }
     } else if (permission.decision !== "allow") {
       return errorResult(input.toolUse, `Permission ${permission.decision}: ${permission.reason}`);
     }
+    throwIfAborted(input.signal);
     const raw = await tool.call(input.toolUse.input, context);
+    throwIfAborted(input.signal);
     return {
       toolCallId: input.toolUse.id,
       toolName: input.toolUse.name,
@@ -375,7 +550,13 @@ export async function executeRegisteredTools(input: {
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
-  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: ToolPermissionResult }) => Promise<boolean> | boolean;
+  signal?: AbortSignal;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseDeniedBundleIds?: string[];
+  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: ToolPermissionResult }) => Promise<ToolApprovalDecision> | ToolApprovalDecision;
 }): Promise<RegisteredToolResult[]> {
   const registry = getBuiltinToolRegistry();
   const results = new Array<RegisteredToolResult>(input.toolUses.length);
@@ -395,9 +576,17 @@ export async function executeRegisteredTools(input: {
     results[index] = await executeRegisteredTool({ ...input, toolUse });
   }));
   for (const { index, toolUse } of sequential) {
+    throwIfAborted(input.signal);
     results[index] = await executeRegisteredTool({ ...input, toolUse });
   }
   return results;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  throw new DOMException(reason ? String(reason) : "Operation cancelled", "AbortError");
 }
 
 export function checkToolPermission(input: {
@@ -408,6 +597,7 @@ export function checkToolPermission(input: {
   env?: NodeJS.ProcessEnv;
   userIntent?: string;
   kiraWorkspaceRoot?: string;
+  sessionId?: string;
   tool?: RegisteredTool;
 }): ToolPermissionResult {
   const tool = input.tool ?? getBuiltinToolRegistry().get(input.toolUse.name);
@@ -420,7 +610,8 @@ export function checkToolPermission(input: {
     rules: input.rules,
     env: input.env,
     userIntent: input.userIntent,
-    kiraWorkspaceRoot: input.kiraWorkspaceRoot
+    kiraWorkspaceRoot: input.kiraWorkspaceRoot,
+    sessionId: input.sessionId
   };
   const custom = tool.checkPermissions?.(input.toolUse.input, context);
   if (custom) {
@@ -467,7 +658,477 @@ export function formatToolResult(input: {
   return `${input.content.slice(0, input.previewChars ?? 2_000)}\n...[truncated]...\n\nFull output saved to: ${file}`;
 }
 
+type ComputerUseToolAction =
+  | "screenshot"
+  | "zoom"
+  | "display_info"
+  | "switch_display"
+  | "permissions"
+  | "cursor_position"
+  | "frontmost_app"
+  | "app_under_point"
+  | "request_access"
+  | "request_teach_access"
+  | "list_granted_apps"
+  | "list_running_apps"
+  | "list_installed_apps"
+  | "open_app"
+  | "click"
+  | "double_click"
+  | "triple_click"
+  | "right_click"
+  | "middle_click"
+  | "move"
+  | "drag"
+  | "left_mouse_down"
+  | "left_mouse_up"
+  | "scroll"
+  | "type"
+  | "key"
+  | "hold_key"
+  | "read_clipboard"
+  | "write_clipboard"
+  | "wait"
+  | "batch"
+  | "teach_step"
+  | "teach_batch";
+
+interface ComputerUseCompatToolOptions {
+  name: string;
+  action: ComputerUseToolAction;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly?: boolean;
+  concurrencySafe?: boolean;
+}
+
+const coordinateTupleSchema = {
+  type: "array",
+  items: { type: "number" },
+  minItems: 2,
+  maxItems: 2,
+  description: "(x, y): Horizontal pixel position read directly from the most recent screenshot image, measured from the left edge. The server handles all scaling."
+};
+
+const clickModifierTextSchema = {
+  type: "string",
+  description: 'Modifier keys to hold during the click (e.g. "shift", "ctrl+shift"). Supports the same syntax as the key tool.'
+};
+
+const computerUseBatchActionSchema = {
+  type: "object",
+  properties: {
+    action: {
+      type: "string",
+      enum: [
+        "key",
+        "type",
+        "mouse_move",
+        "left_click",
+        "left_click_drag",
+        "right_click",
+        "middle_click",
+        "double_click",
+        "triple_click",
+        "scroll",
+        "hold_key",
+        "screenshot",
+        "cursor_position",
+        "left_mouse_down",
+        "left_mouse_up",
+        "wait"
+      ],
+      description: "The action to perform."
+    },
+    coordinate: {
+      ...coordinateTupleSchema,
+      description: "(x, y) for click/mouse_move/scroll/left_click_drag end point."
+    },
+    start_coordinate: {
+      ...coordinateTupleSchema,
+      description: "(x, y) drag start — left_click_drag only. Omit to drag from current cursor."
+    },
+    text: {
+      type: "string",
+      description: "For type: the text. For key/hold_key: the chord string. For click/scroll: modifier keys to hold."
+    },
+    scroll_amount: { type: "integer", minimum: 0, maximum: 100 },
+    duration: { type: "number", description: "Seconds (0–100). For hold_key/wait." },
+    repeat: { type: "integer", minimum: 1, maximum: 100, description: "For key: repeat count." },
+  },
+  required: ["action"]
+};
+
+function computerUseSchema(properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> {
+  return {
+    type: "object",
+    properties,
+    required
+  };
+}
+
+function computerUseCompatTool(options: ComputerUseCompatToolOptions): RegisteredTool {
+  return {
+    name: options.name,
+    description: options.description,
+    category: "system",
+    tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos", "windows"],
+    inputSchema: options.inputSchema,
+    call: async (input, context) => callComputerUseAction({ ...input, action: options.action }, context),
+    isReadOnly: () => options.readOnly ?? isComputerUseReadOnlyAction(options.action),
+    isDestructive: () => false,
+    isConcurrencySafe: () => options.concurrencySafe ?? (options.readOnly ?? isComputerUseReadOnlyAction(options.action)),
+    checkPermissions: (input, context) => checkComputerUseToolPermission({ ...input, action: options.action }, context)
+  };
+}
+
+async function callComputerUseAction(
+  input: Record<string, unknown>,
+  context: ToolExecutionContext
+): Promise<string> {
+  const parsed = parseComputerUseInput(input);
+  const result = await executeComputerUse(parsed, {
+    cwd: context.kiraWorkspaceRoot ?? context.cwd,
+    kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+    env: context.env,
+    sessionId: context.sessionId,
+    signal: context.signal,
+    deniedBundleIds: context.computerUseDeniedBundleIds,
+    approvalResponse: context.computerUseApprovalResponse,
+    teachStepResolver: context.computerUseTeachStepResolver,
+    hideHostWindow: context.computerUseHideHostWindow,
+    teachModeActivated: context.computerUseTeachModeActivated,
+    teachModeExited: context.computerUseTeachModeExited
+  });
+  return formatComputerUseResult(result);
+}
+
+function checkComputerUseToolPermission(
+  input: Record<string, unknown>,
+  context: ToolExecutionContext
+): ToolPermissionResult | undefined {
+  if (isComputerUseReadOnlyAction(input.action)) {
+    return undefined;
+  }
+  if (input.action === "request_access") {
+    if (isIdempotentComputerUseAccessRequest(input, context)) {
+      return { decision: "allow", reason: "ComputerUse access was already granted for this session" };
+    }
+    return { decision: "ask", reason: "ComputerUse is requesting permission to control selected desktop apps" };
+  }
+  if (input.action === "request_teach_access") {
+    return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };
+  }
+  if (input.action === "read_clipboard" || input.action === "write_clipboard") {
+    return { decision: "allow", reason: "ComputerUse clipboard grant flags are enforced at execution time" };
+  }
+  return { decision: "allow", reason: "ComputerUse session app grants and tier policy are enforced at execution time" };
+}
+
+const COMPUTER_USE_COMPAT_TOOLS: RegisteredTool[] = [
+  computerUseCompatTool({
+    name: "request_access",
+    action: "request_access",
+    description: "Request user permission to control a set of applications for this session. Must be called before any other tool in this server. The user sees a single dialog listing all requested apps and either allows the whole set or denies it. Call this again mid-session to add more apps; previously granted apps remain granted. Returns the granted apps, denied apps, and screenshot filtering capability.",
+    inputSchema: computerUseSchema({
+      apps: { type: "array", items: { type: "string" }, description: 'Application display names (e.g. "Slack", "Calendar") or bundle identifiers (e.g. "com.tinyspeck.slackmacgap"). Display names are resolved case-insensitively against installed apps.' },
+      reason: { type: "string", description: "One-sentence explanation shown to the user in the approval dialog. Explain the task, not the mechanism." },
+      clipboardRead: { type: "boolean", description: "Also request permission to read the user's clipboard (separate checkbox in the dialog)." },
+      clipboardWrite: { type: "boolean", description: "Also request permission to write the user's clipboard. When granted, multi-line `type` calls use the clipboard fast path." },
+      systemKeyCombos: { type: "boolean", description: "Also request permission to send system-level key combos (quit app, switch app, lock screen). Without this, those specific combos are blocked." }
+    }, ["apps", "reason"])
+  }),
+  computerUseCompatTool({
+    name: "screenshot",
+    action: "screenshot",
+    description: "Take a screenshot of the primary display. Applications not in the session allowlist are excluded at the compositor level — only granted apps and the desktop are visible. Returns an error if the allowlist is empty. The returned image is what subsequent click coordinates are relative to.",
+    inputSchema: computerUseSchema({
+      save_to_disk: { type: "boolean", description: "Save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image — screenshots you're just looking at don't need saving." }
+    }),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "zoom",
+    action: "zoom",
+    description: "Take a higher-resolution screenshot of a specific region of the last full-screen screenshot. Use this liberally to inspect small text, button labels, or fine UI details that are hard to read in the downsampled full-screen image. IMPORTANT: Coordinates in subsequent click calls always refer to the full-screen screenshot, never the zoomed image. This tool is read-only for inspecting detail.",
+    inputSchema: computerUseSchema({
+      region: { type: "array", items: { type: "integer" }, minItems: 4, maxItems: 4, description: "(x0, y0, x1, y1): Rectangle to zoom into, in the coordinate space of the most recent full-screen screenshot. x0,y0 = top-left, x1,y1 = bottom-right." },
+      save_to_disk: { type: "boolean", description: "Save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image." }
+    }, ["region"]),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "left_click",
+    action: "click",
+    description: "Left-click at the given coordinates. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema, text: clickModifierTextSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "double_click",
+    action: "double_click",
+    description: "Double-click at the given coordinates. Selects a word in most text editors. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema, text: clickModifierTextSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "triple_click",
+    action: "triple_click",
+    description: "Triple-click at the given coordinates. Selects a line in most text editors. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema, text: clickModifierTextSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "right_click",
+    action: "right_click",
+    description: "Right-click at the given coordinates. Opens a context menu in most applications. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema, text: clickModifierTextSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "middle_click",
+    action: "middle_click",
+    description: "Middle-click (scroll-wheel click) at the given coordinates. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema, text: clickModifierTextSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "type",
+    action: "type",
+    description: "Type text into whatever currently has keyboard focus. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. Newlines are supported. For keyboard shortcuts use `key` instead.",
+    inputSchema: computerUseSchema({ text: { type: "string", description: "Text to type." } }, ["text"])
+  }),
+  computerUseCompatTool({
+    name: "key",
+    action: "key",
+    description: "Press a key or key combination (e.g. \"return\", \"escape\", \"cmd+a\", \"ctrl+shift+tab\"). The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. System-level combos (quit app, switch app, lock screen) require the `systemKeyCombos` grant — without it they return an error. All other combos work.",
+    inputSchema: computerUseSchema({
+      text: { type: "string", description: 'Modifiers joined with "+", e.g. "cmd+shift+a".' },
+      repeat: { type: "integer", minimum: 1, maximum: 100, description: "Number of times to repeat the key press. Default is 1." }
+    }, ["text"])
+  }),
+  computerUseCompatTool({
+    name: "scroll",
+    action: "scroll",
+    description: "Scroll at the given coordinates. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({
+      coordinate: coordinateTupleSchema,
+      scroll_direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Direction to scroll." },
+      scroll_amount: { type: "integer", minimum: 0, maximum: 100, description: "Number of scroll ticks." }
+    }, ["coordinate", "scroll_direction", "scroll_amount"])
+  }),
+  computerUseCompatTool({
+    name: "left_click_drag",
+    action: "drag",
+    description: "Press, move to target, and release. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({
+      coordinate: { ...coordinateTupleSchema, description: "(x, y) end point: Horizontal pixel position read directly from the most recent screenshot image, measured from the left edge. The server handles all scaling." },
+      start_coordinate: { ...coordinateTupleSchema, description: "(x, y) start point. If omitted, drags from the current cursor position. Horizontal pixel position read directly from the most recent screenshot image, measured from the left edge. The server handles all scaling." }
+    }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "mouse_move",
+    action: "move",
+    description: "Move the mouse cursor without clicking. Useful for triggering hover states. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema }, ["coordinate"])
+  }),
+  computerUseCompatTool({
+    name: "open_application",
+    action: "open_app",
+    description: "Bring an application to the front, launching it if necessary. The target application must already be in the session allowlist — call request_access first.",
+    inputSchema: computerUseSchema({
+      app: { type: "string", description: 'Display name (e.g. "Slack") or bundle identifier (e.g. "com.tinyspeck.slackmacgap").' }
+    }, ["app"])
+  }),
+  computerUseCompatTool({
+    name: "switch_display",
+    action: "switch_display",
+    description: "Switch which monitor subsequent screenshots capture. Use this when the application you need is on a different monitor than the one shown. The screenshot tool tells you which monitor it captured and lists other attached monitors by name — pass one of those names here. After switching, call screenshot to see the new monitor. Pass \"auto\" to return to automatic monitor selection.",
+    inputSchema: computerUseSchema({
+      display: { type: "string", description: 'Monitor name from the screenshot note (e.g. "Built-in Retina Display", "LG UltraFine"), or "auto" to re-enable automatic selection.' }
+    }, ["display"])
+  }),
+  computerUseCompatTool({
+    name: "list_granted_applications",
+    action: "list_granted_apps",
+    description: "List the applications currently in the session allowlist, plus the active grant flags and coordinate mode. No side effects.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "read_clipboard",
+    action: "read_clipboard",
+    description: "Read the current clipboard contents as text. Requires the `clipboardRead` grant.",
+    inputSchema: computerUseSchema({})
+  }),
+  computerUseCompatTool({
+    name: "write_clipboard",
+    action: "write_clipboard",
+    description: "Write text to the clipboard. Requires the `clipboardWrite` grant.",
+    inputSchema: computerUseSchema({ text: { type: "string" } }, ["text"])
+  }),
+  computerUseCompatTool({
+    name: "wait",
+    action: "wait",
+    description: "Wait for a specified duration.",
+    inputSchema: computerUseSchema({ duration: { type: "number", description: "Duration in seconds (0–100)." } }, ["duration"])
+  }),
+  computerUseCompatTool({
+    name: "cursor_position",
+    action: "cursor_position",
+    description: "Get the current mouse cursor position. Returns image-pixel coordinates relative to the most recent screenshot, or logical points if no screenshot has been taken.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "hold_key",
+    action: "hold_key",
+    description: "Press and hold a key or key combination for the specified duration, then release. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. System-level combos require the `systemKeyCombos` grant.",
+    inputSchema: computerUseSchema({
+      text: { type: "string", description: 'Key or chord to hold, e.g. "space", "shift+down".' },
+      duration: { type: "number", description: "Duration in seconds (0–100)." }
+    }, ["text", "duration"])
+  }),
+  computerUseCompatTool({
+    name: "left_mouse_down",
+    action: "left_mouse_down",
+    description: "Press the left mouse button at the current cursor position and leave it held. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. Use mouse_move first to position the cursor. Call left_mouse_up to release. Errors if the button is already held.",
+    inputSchema: computerUseSchema({})
+  }),
+  computerUseCompatTool({
+    name: "left_mouse_up",
+    action: "left_mouse_up",
+    description: "Release the left mouse button at the current cursor position. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. Pairs with left_mouse_down. Safe to call even if the button is not currently held.",
+    inputSchema: computerUseSchema({})
+  }),
+  computerUseCompatTool({
+    name: "computer_batch",
+    action: "batch",
+    description: "Execute a sequence of actions in ONE tool call. Each individual tool call requires a model→API round trip (seconds); batching a predictable sequence eliminates all but one. Use this whenever you can predict the outcome of several actions ahead — e.g. click a field, type into it, press Return. Actions execute sequentially and stop on the first error. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. The frontmost check runs before EACH action inside the batch — if an action opens a non-allowed app, the next action's gate fires and the batch stops there. Mid-batch screenshot actions are allowed for inspection but coordinates in subsequent clicks always refer to the PRE-BATCH full-screen screenshot.",
+    inputSchema: computerUseSchema({
+      actions: {
+        type: "array",
+        minItems: 1,
+        items: computerUseBatchActionSchema,
+        description: 'List of actions. Example: [{"action":"left_click","coordinate":[100,200]},{"action":"type","text":"hello"},{"action":"key","text":"Return"}]'
+      }
+    }, ["actions"])
+  }),
+  computerUseCompatTool({
+    name: "request_teach_access",
+    action: "request_teach_access",
+    description: "Request permission to guide the user through a task step-by-step with on-screen tooltips. Use this INSTEAD OF request_access when the user wants to LEARN how to do something (phrases like \"teach me\", \"walk me through\", \"show me how\", \"help me learn\"). On approval the main Claude window hides and a fullscreen tooltip overlay appears. You then call teach_step repeatedly; each call shows one tooltip and waits for the user to click Next. Same app-allowlist semantics as request_access, but no clipboard/system-key flags. Teach mode ends automatically when your turn ends.",
+    inputSchema: computerUseSchema({
+      apps: { type: "array", items: { type: "string" }, description: 'Application display names (e.g. "Slack", "Calendar") or bundle identifiers. Resolved case-insensitively against installed apps.' },
+      reason: { type: "string", description: 'What you will be teaching. Shown in the approval dialog as "Claude wants to guide you through {reason}". Keep it short and task-focused.' }
+    }, ["apps", "reason"])
+  }),
+  computerUseCompatTool({
+    name: "teach_step",
+    action: "teach_step",
+    description: "Show one guided-tour tooltip and wait for the user to click Next. On Next, execute the actions, take a fresh screenshot, and return both — you do NOT need a separate screenshot call between steps. The returned image shows the state after your actions ran; anchor the next teach_step against it. IMPORTANT — the user only sees the tooltip during teach mode. Put ALL narration in `explanation`. Text you emit outside teach_step calls is NOT visible until teach mode ends. Pack as many actions as possible into each step's `actions` array — the user waits through the whole round trip between clicks, so one step that fills a form beats five steps that fill one field each. Returns {exited:true} if the user clicks Exit — do not call teach_step again after that. Take an initial screenshot before your FIRST teach_step to anchor it.",
+    inputSchema: computerUseSchema({
+      explanation: {
+        type: "string",
+        description: "Tooltip body text. Explain what the user is looking at and why it matters. This is the ONLY place the user sees your words — be complete but concise."
+      },
+      next_preview: {
+        type: "string",
+        description: 'One line describing exactly what will happen when the user clicks Next. Example: "Next: I\'ll click Create Bucket and type the name." Shown below the explanation in a smaller font.'
+      },
+      anchor: {
+        ...coordinateTupleSchema,
+        description: "(x, y) — where the tooltip arrow points. Horizontal pixel position read directly from the most recent screenshot image, measured from the left edge. The server handles all scaling. Omit to center the tooltip with no arrow (for general-context steps)."
+      },
+      actions: {
+        type: "array",
+        items: computerUseBatchActionSchema,
+        description: "Actions to execute when the user clicks Next. Same item schema as computer_batch.actions. Empty array is valid for purely explanatory steps. Actions run sequentially and stop on first error."
+      }
+    }, ["explanation", "next_preview", "actions"])
+  }),
+  computerUseCompatTool({
+    name: "teach_batch",
+    action: "teach_batch",
+    description: "Queue multiple teach steps in one tool call. Parallels computer_batch: N steps → one model↔API round trip instead of N. Each step still shows a tooltip and waits for the user's Next click, but YOU aren't waiting for a round trip between steps. You can call teach_batch multiple times in one tour — treat each batch as one predictable SEGMENT (typically: all the steps on one page). The returned screenshot shows the state after the batch's final actions; anchor the NEXT teach_batch against it. WITHIN a batch, all anchors and click coordinates refer to the PRE-BATCH screenshot (same invariant as computer_batch) — for steps 2+ in a batch, either omit anchor (centered tooltip) or target elements you know won't have moved. Good pattern: batch 5 tooltips on page A (last step navigates) → read returned screenshot → batch 3 tooltips on page B → done. Returns {exited:true, stepsCompleted:N} if the user clicks Exit — do NOT call again after that; {stepsCompleted, stepFailed, ...} if an action errors mid-batch; otherwise {stepsCompleted, results:[...]} plus a final screenshot. Fall back to individual teach_step calls when you need to react to each intermediate screenshot.",
+    inputSchema: computerUseSchema({
+      steps: {
+        type: "array",
+        minItems: 1,
+        items: computerUseSchema({
+          explanation: {
+            type: "string",
+            description: "Tooltip body text. Explain what the user is looking at and why it matters. This is the ONLY place the user sees your words — be complete but concise."
+          },
+          next_preview: {
+            type: "string",
+            description: 'One line describing exactly what will happen when the user clicks Next. Example: "Next: I\'ll click Create Bucket and type the name." Shown below the explanation in a smaller font.'
+          },
+          anchor: {
+            ...coordinateTupleSchema,
+            description: "(x, y) — where the tooltip arrow points. Horizontal pixel position read directly from the most recent screenshot image, measured from the left edge. The server handles all scaling. Omit to center the tooltip with no arrow (for general-context steps)."
+          },
+          actions: {
+            type: "array",
+            items: computerUseBatchActionSchema,
+            description: "Actions to execute when the user clicks Next. Same item schema as computer_batch.actions. Empty array is valid for purely explanatory steps. Actions run sequentially and stop on first error."
+          }
+        }, ["explanation", "next_preview", "actions"]),
+        description: "Ordered steps. Validated upfront — a typo in step 5 errors before any tooltip shows."
+      }
+    }, ["steps"])
+  }),
+  computerUseCompatTool({
+    name: "display_info",
+    action: "display_info",
+    description: "List attached displays and geometry for Computer Use.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "permissions",
+    action: "permissions",
+    description: "Best-effort Computer Use setup check. Use only for diagnostics; macOS can report stale results after app updates, so do not loop on this before normal desktop tasks.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "frontmost_app",
+    action: "frontmost_app",
+    description: "Identify the current frontmost desktop app.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "app_under_point",
+    action: "app_under_point",
+    description: "Identify the app under a screenshot coordinate.",
+    inputSchema: computerUseSchema({ coordinate: coordinateTupleSchema }, ["coordinate"]),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "list_running_applications",
+    action: "list_running_apps",
+    description: "List currently running desktop apps.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  }),
+  computerUseCompatTool({
+    name: "list_installed_applications",
+    action: "list_installed_apps",
+    description: "List installed desktop apps that can be requested for Computer Use.",
+    inputSchema: computerUseSchema({}),
+    readOnly: true,
+    concurrencySafe: true
+  })
+];
+
 const BUILTIN_TOOLS: RegisteredTool[] = [
+  ...COMPUTER_USE_COMPAT_TOOLS,
   {
     name: "FileRead",
     description: "Read a UTF-8 text file inside the current workspace.",
@@ -650,6 +1311,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         timeoutMs: readOptionalNumber(input, "timeout_ms"),
         env: context.env,
         kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+        signal: context.signal,
         // Dangerous commands are gated by checkPermissions before this call.
         approveDangerous: true
       });
@@ -1533,23 +2195,47 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "ComputerUse",
-    description: "Observe and control the macOS desktop. Actions: screenshot, click, double_click, right_click, move, drag, type, key, hotkey. Use screenshot first to inspect the screen. Mouse and keyboard actions require explicit user approval.",
+    description: "Observe and control the visible desktop. Actions: screenshot, zoom, display_info, switch_display, permissions, cursor_position, frontmost_app, app_under_point, request_access, request_teach_access, list_granted_apps, list_running_apps, list_installed_apps, open_app, click, double_click, triple_click, right_click, middle_click, move, drag, left_mouse_down, left_mouse_up, scroll, type, key, hold_key, hotkey, read_clipboard, write_clipboard, wait, batch, teach_step, teach_batch. macOS Screen Recording and Accessibility are first-run setup items in Kira Settings; do not repeatedly ask for OS permissions during a task if the user says they are granted. Call request_access with target apps and reason before controlling apps. Use request_teach_access plus teach_step/teach_batch when the user wants to learn or be guided. Use display_info and switch_display for multi-monitor work. Use screenshot first to inspect the screen, then zoom to inspect small text. Use left_mouse_down/up for held-button interactions after moving the pointer. Batch coordinates refer to the same pre-batch screenshot.",
     category: "system",
-    tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos"],
+    tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos", "windows"],
     inputSchema: ComputerUseInputSchema,
     call: async (input, context) => {
       const parsed = parseComputerUseInput(input);
-      const result = await executeComputerUse(parsed, { cwd: context.kiraWorkspaceRoot ?? context.cwd });
+      const result = await executeComputerUse(parsed, {
+        cwd: context.kiraWorkspaceRoot ?? context.cwd,
+        kiraWorkspaceRoot: context.kiraWorkspaceRoot,
+        env: context.env,
+        sessionId: context.sessionId,
+        signal: context.signal,
+        deniedBundleIds: context.computerUseDeniedBundleIds,
+        approvalResponse: context.computerUseApprovalResponse,
+        teachStepResolver: context.computerUseTeachStepResolver,
+        hideHostWindow: context.computerUseHideHostWindow,
+        teachModeActivated: context.computerUseTeachModeActivated,
+        teachModeExited: context.computerUseTeachModeExited
+      });
       return formatComputerUseResult(result);
     },
-    isReadOnly: (input) => input.action === "screenshot",
+    isReadOnly: (input) => isComputerUseReadOnlyAction(input.action),
     isDestructive: () => false,
-    isConcurrencySafe: (input) => input.action === "screenshot",
-    checkPermissions: (input) => {
-      if (input.action === "screenshot") {
+    isConcurrencySafe: (input) => isComputerUseReadOnlyAction(input.action),
+    checkPermissions: (input, context) => {
+      if (isComputerUseReadOnlyAction(input.action)) {
         return undefined;
       }
-      return { decision: "ask", reason: `ComputerUse ${String(input.action)} controls the real desktop` };
+      if (input.action === "request_access") {
+        if (isIdempotentComputerUseAccessRequest(input, context)) {
+          return { decision: "allow", reason: "ComputerUse access was already granted for this session" };
+        }
+        return { decision: "ask", reason: "ComputerUse is requesting permission to control selected desktop apps" };
+      }
+      if (input.action === "request_teach_access") {
+        return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };
+      }
+      if (input.action === "read_clipboard" || input.action === "write_clipboard") {
+        return { decision: "allow", reason: "ComputerUse clipboard grant flags are enforced at execution time" };
+      }
+      return { decision: "allow", reason: "ComputerUse session app grants and tier policy are enforced at execution time" };
     }
   },
   {

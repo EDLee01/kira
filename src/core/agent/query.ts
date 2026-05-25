@@ -13,8 +13,10 @@ import {
 import { ProviderError } from "../providers/errors.ts";
 import { HookDefinition, McpServerConfig, WebSearchConfig } from "../config.ts";
 import { executeHooks, HookResult } from "../hooks/runner.ts";
-import { AgentToolResult, BUILTIN_AGENT_TOOLS, executeBuiltinAgentTools, ToolPermissionMode } from "./tools.ts";
-import { SubAgentRequest, SubAgentResult } from "../tools/registry.ts";
+import { AgentToolResult, BUILTIN_AGENT_TOOLS, executeBuiltinAgentTools, getBuiltinAgentTools, ToolPermissionMode } from "./tools.ts";
+import { getComputerUseInstalledAppNamesHint } from "../tools/registry.ts";
+import type { ComputerUseToolDefinitionContext, ToolApprovalDecision } from "../tools/registry.ts";
+import type { ComputerUseContext, ComputerUseTeachStepResolver, SubAgentRequest, SubAgentResult } from "../tools/registry.ts";
 import { McpToolRegistry } from "../mcp/tool-registry.ts";
 import { AskUserQuestionRequest, AskUserQuestionAnswer, UserQuestionResolver } from "../tools/user-question.ts";
 import { SendUserMessageRequest, SendUserMessageResult, UserMessageSink } from "../tools/user-message.ts";
@@ -77,7 +79,12 @@ export interface AgentQueryInput {
   maxOutputTokens?: number;
   permissionMode?: ToolPermissionMode;
   disabledBuiltinTools?: string[];
-  approvalResolver?: (request: { toolUse: MagiToolUsePart; reason: string; diff?: string }) => Promise<boolean> | boolean;
+  approvalResolver?: (request: { toolUse: MagiToolUsePart; reason: string; diff?: string }) => Promise<ToolApprovalDecision> | ToolApprovalDecision;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseDeniedBundleIds?: string[];
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
@@ -121,7 +128,12 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
 
     for (let turn = 0; turn < maxTurns; turn++) {
       throwIfCancelled(input.signal);
-      const toolDefinitions = await getAgentToolDefinitions(mcpTools, disabledBuiltinTools);
+      const toolDefinitions = await getAgentToolDefinitions(mcpTools, disabledBuiltinTools, {
+        cwd: input.cwd,
+        kiraWorkspaceRoot: input.kiraWorkspaceRoot,
+        env: input.env,
+        signal: input.signal
+      });
       let response: ProviderResponse;
       let streamedTextThisTurn = "";
       while (true) {
@@ -505,6 +517,7 @@ async function executePreparedToolUses(
       sessionId: input.sessionId,
       webSearchConfig: input.webSearchConfig,
       permissionMode: input.permissionMode,
+      signal: input.signal,
       promptModel,
       userQuestionResolver: async (request) => {
         if (!input.userQuestionResolver) {
@@ -540,6 +553,11 @@ async function executePreparedToolUses(
         }
         return input.approvalResolver?.({ toolUse, reason: permission.reason, diff: permission.diff }) ?? false;
       },
+      computerUseTeachStepResolver: input.computerUseTeachStepResolver,
+      computerUseHideHostWindow: input.computerUseHideHostWindow,
+      computerUseTeachModeActivated: input.computerUseTeachModeActivated,
+      computerUseTeachModeExited: input.computerUseTeachModeExited,
+      computerUseDeniedBundleIds: input.computerUseDeniedBundleIds,
       spawnSubAgent: input.spawnSubAgent
     });
     for (const [resultIndex, result] of builtInResults.entries()) {
@@ -549,7 +567,8 @@ async function executePreparedToolUses(
       for (const { index, toolUse } of mcp) {
         const first = await mcpTools.executeTool({ toolUse });
         if (first.permission?.decision === "ask" && input.approvalResolver) {
-          const approved = await input.approvalResolver({ toolUse, reason: first.permission.reason });
+          const approval = await input.approvalResolver({ toolUse, reason: first.permission.reason });
+          const approved = typeof approval === "boolean" ? approval : approval.approved;
           results[index] = approved ? await mcpTools.executeTool({ toolUse, approved: true }) : first;
         } else {
           results[index] = first;
@@ -571,9 +590,12 @@ async function executePreparedToolUses(
 
 async function getAgentToolDefinitions(
   mcpTools: McpToolRegistry | undefined,
-  disabledBuiltinTools: ReadonlySet<string> = new Set()
+  disabledBuiltinTools: ReadonlySet<string> = new Set(),
+  context?: ComputerUseToolDefinitionContext
 ): Promise<MagiToolDefinition[]> {
-  const builtInTools = BUILTIN_AGENT_TOOLS.filter((tool) => !disabledBuiltinTools.has(tool.name));
+  const installedAppNames = context ? await getComputerUseInstalledAppNamesHint(context) : undefined;
+  const allBuiltinTools = getBuiltinAgentTools({ computerUseInstalledAppNames: installedAppNames });
+  const builtInTools = allBuiltinTools.filter((tool) => !disabledBuiltinTools.has(tool.name));
   if (!mcpTools) {
     return builtInTools;
   }

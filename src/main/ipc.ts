@@ -1,4 +1,4 @@
-import { ipcMain, BrowserWindow, dialog, shell } from "electron";
+import { ipcMain, BrowserWindow, dialog, shell, systemPreferences } from "electron";
 import { Engine } from "./engine";
 import { SessionStore } from "../core/session-store.ts";
 import { getMagiPaths } from "../core/paths.ts";
@@ -86,7 +86,7 @@ export function registerIPC(win: BrowserWindow): void {
   const writeSettings = (settings: Record<string, string>) => writeDesktopSettings(paths, settings);
   const normalizeIncomingSettings = (settings: Record<string, unknown>): Record<string, string> => {
     const normalized: Record<string, string> = {};
-    for (const key of ["provider", "baseUrl", "apiKey", "model", "openAiEndpoint", "theme", "workspace", "kiraWorkspaceRoot"]) {
+    for (const key of ["provider", "baseUrl", "apiKey", "model", "openAiEndpoint", "theme", "workspace", "kiraWorkspaceRoot", "computerUseDeniedBundleIds"]) {
       const value = settings[key];
       if (typeof value === "string") normalized[key] = value;
     }
@@ -142,6 +142,28 @@ export function registerIPC(win: BrowserWindow): void {
 
   ipcMain.handle("engine:status", () => {
     return { running: engine.running, sessionId: engine.sessionId };
+  });
+
+  ipcMain.handle("app:trust-status", () => {
+    const settings = readSettings();
+    const provider = readProvider(settings.provider);
+    const defaults = providerDefaults(provider);
+    const apiKey = settings.apiKey || process.env[defaults.apiKeyEnv] || "";
+    return {
+      platform: process.platform,
+      arch: process.arch,
+      model: {
+        provider,
+        configured: Boolean(apiKey),
+        model: settings.model || process.env[defaults.modelEnv] || defaults.defaultModel
+      },
+      workspace: buildKiraWorkspaceInfo(engine.kiraWorkspaceRoot, engine.cwd),
+      permissions: readMacPermissionStatus(),
+      browserAutomation: {
+        playwrightEnabled: false,
+        message: "Playwright automation is disabled by default. Kira uses the visible desktop context first."
+      }
+    };
   });
 
   ipcMain.handle("goal:handle", (_event, sessionId: string, text: string) => {
@@ -297,6 +319,7 @@ export function registerIPC(win: BrowserWindow): void {
       modelsUpdatedAt: modelDiscovery.updatedAt,
       kiraWorkspaceRoot: engine.kiraWorkspaceRoot,
       workspace: engine.cwd,
+      computerUseDeniedBundleIds: saved.computerUseDeniedBundleIds || "[]",
     };
   });
 
@@ -438,6 +461,35 @@ export function registerIPC(win: BrowserWindow): void {
     }
     void shell.openExternal(parsed.toString());
   });
+
+  ipcMain.handle("app:open-permission-settings", (_event, pane: string) => {
+    if (process.platform !== "darwin") return;
+    const target = pane === "accessibility"
+      ? "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+      : "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+    void shell.openExternal(target);
+  });
+}
+
+function readMacPermissionStatus(): {
+  screen: "granted" | "denied" | "restricted" | "not-determined" | "unknown" | "unsupported";
+  accessibility: "granted" | "denied" | "unsupported";
+} {
+  if (process.platform !== "darwin") {
+    return { screen: "unsupported", accessibility: "unsupported" };
+  }
+  let screen: ReturnType<typeof systemPreferences.getMediaAccessStatus> | "unknown" = "unknown";
+  try {
+    screen = systemPreferences.getMediaAccessStatus("screen");
+  } catch {}
+  let accessibility = false;
+  try {
+    accessibility = systemPreferences.isTrustedAccessibilityClient(false);
+  } catch {}
+  return {
+    screen,
+    accessibility: accessibility ? "granted" : "denied"
+  };
 }
 
 function readProvider(value: string | undefined): DesktopProviderKind {
@@ -472,7 +524,7 @@ export function unregisterIPC(): void {
     "mcp:list", "mcp:add", "mcp:remove",
     "remote:start", "remote:stop", "remote:status",
     "config:get",
-    "app:info", "app:open-external",
+    "app:info", "app:trust-status", "app:open-external", "app:open-permission-settings",
   ];
   for (const h of handlers) {
     ipcMain.removeHandler(h);

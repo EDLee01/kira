@@ -36,6 +36,7 @@ interface SettingsState {
   modelsUpdatedAt?: string;
   kiraWorkspaceRoot?: string;
   workspace?: string;
+  computerUseDeniedBundleIds?: string;
 }
 
 interface WorkspaceInfo {
@@ -43,6 +44,25 @@ interface WorkspaceInfo {
   projectDir: string;
   projectsRoot: string;
   isProjectInsideWorkspace: boolean;
+}
+
+interface TrustStatus {
+  platform: string;
+  arch: string;
+  model: {
+    provider: string;
+    configured: boolean;
+    model: string;
+  };
+  workspace: WorkspaceInfo;
+  permissions: {
+    screen: "granted" | "denied" | "restricted" | "not-determined" | "unknown" | "unsupported";
+    accessibility: "granted" | "denied" | "unsupported";
+  };
+  browserAutomation: {
+    playwrightEnabled: boolean;
+    message: string;
+  };
 }
 
 declare global {
@@ -63,6 +83,8 @@ declare global {
       setSettings: (s: SettingsState) => Promise<SettingsState>;
       testConnection: (s: { provider?: string; baseUrl: string; apiKey: string; model: string; openAiEndpoint?: string }) => Promise<{ ok: boolean; message: string; discovery?: { models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string } }>;
       discoverModels: (s: { provider?: string; baseUrl: string; apiKey: string; model: string; openAiEndpoint?: string }) => Promise<{ ok: boolean; message: string; models: DiscoveredModel[]; auto: AutoModelRoutes; updatedAt: string }>;
+      getTrustStatus: () => Promise<TrustStatus>;
+      openPermissionSettings: (pane: "screen" | "accessibility") => Promise<void>;
       listScheduledTasks: () => Promise<any[]>;
       pauseTask: (id: string) => Promise<any>;
       resumeTask: (id: string) => Promise<any>;
@@ -107,6 +129,28 @@ function displayPathName(workspace: string | undefined, fallback = "Workspace"):
   if (!trimmed) return fallback;
   const parts = trimmed.split(/[\\/]+/);
   return parts[parts.length - 1] || trimmed;
+}
+
+function trustTone(ok: boolean | undefined): "ok" | "warn" | "muted" {
+  if (ok === true) return "ok";
+  if (ok === false) return "warn";
+  return "muted";
+}
+
+function permissionOk(value: string | undefined): boolean | undefined {
+  if (!value || value === "unsupported") return undefined;
+  return value === "granted";
+}
+
+function permissionLabel(value: string | undefined): string {
+  switch (value) {
+    case "granted": return "Ready";
+    case "denied": return "Check Settings";
+    case "restricted": return "Check Settings";
+    case "not-determined": return "Check Settings";
+    case "unsupported": return "Unsupported";
+    default: return "Check Settings";
+  }
 }
 
 /** Extract display text from a parsed message content field */
@@ -192,6 +236,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"chat" | "tasks">("chat");
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [settings, setSettings] = useState<SettingsState>({ provider: "anthropic", baseUrl: "", apiKey: "", model: "", openAiEndpoint: "chat", theme: "dark" });
+  const [trustStatus, setTrustStatus] = useState<TrustStatus | null>(null);
   const streamText = useRef("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -203,6 +248,14 @@ export default function App() {
     try {
       const list = await window.desktopAPI.listSessions();
       setSessions(list ?? []);
+    } catch {}
+  }, []);
+
+  const loadTrustStatus = useCallback(async () => {
+    try {
+      const status = await window.desktopAPI.getTrustStatus();
+      setTrustStatus(status);
+      setWorkspace(status.workspace);
     } catch {}
   }, []);
 
@@ -219,6 +272,7 @@ export default function App() {
       const s = await window.desktopAPI.getSettings();
       setSettings(s);
       document.documentElement.setAttribute("data-theme", s.theme || "dark");
+      await loadTrustStatus();
 
       const list = await window.desktopAPI.listSessions();
       if (list && list.length > 0) {
@@ -242,7 +296,7 @@ export default function App() {
         setSid(newId);
       }
     })();
-  }, [markdownSampleMode]);
+  }, [loadTrustStatus, markdownSampleMode]);
 
   // Click outside to close history dropdown
   useEffect(() => {
@@ -372,16 +426,20 @@ export default function App() {
   // Pick workspace
   const pickWorkspace = useCallback(async () => {
     const info = await window.desktopAPI.pickWorkspace();
-    if (info) setWorkspace(info);
-  }, []);
+    if (info) {
+      setWorkspace(info);
+      void loadTrustStatus();
+    }
+  }, [loadTrustStatus]);
 
   // Save settings
   const saveSettings = useCallback(async (newSettings: SettingsState) => {
     await window.desktopAPI.setSettings(newSettings);
     setSettings(newSettings);
     document.documentElement.setAttribute("data-theme", newSettings.theme || "dark");
+    await loadTrustStatus();
     setShowSettings(false);
-  }, []);
+  }, [loadTrustStatus]);
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -536,7 +594,9 @@ export default function App() {
         <SettingsPanel
           settings={settings}
           workspace={workspace}
+          trustStatus={trustStatus}
           onWorkspaceChange={setWorkspace}
+          onTrustRefresh={loadTrustStatus}
           onSave={saveSettings}
           onClose={() => setShowSettings(false)}
         />
@@ -565,6 +625,9 @@ export default function App() {
             </div>
             <h2 className="empty-title">Kira</h2>
             <p className="empty-sub">你的全能 AI 搭子，随时待命</p>
+            {trustStatus && !trustStatus.model.configured && (
+              <button className="setup-cta" onClick={() => setShowSettings(true)}>Set up Kira</button>
+            )}
             <div className="suggestions">
               {["打开浏览器访问指定网址", "搜索一下竞品信息", "帮我整理今天的工作"].map((s) => (
                 <button key={s} className="suggestion" onClick={() => setInput(s)}>
@@ -663,10 +726,12 @@ export default function App() {
 }
 
 /** Settings Panel */
-function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose }: {
+function SettingsPanel({ settings, workspace, trustStatus, onWorkspaceChange, onTrustRefresh, onSave, onClose }: {
   settings: SettingsState;
   workspace: WorkspaceInfo | null;
+  trustStatus: TrustStatus | null;
   onWorkspaceChange: (workspace: WorkspaceInfo) => void;
+  onTrustRefresh: () => Promise<void>;
   onSave: (s: SettingsState) => void;
   onClose: () => void;
 }) {
@@ -692,6 +757,7 @@ function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose
     const info = await window.desktopAPI.pickKiraWorkspaceRoot();
     if (!info) return;
     onWorkspaceChange(info);
+    void onTrustRefresh();
     setForm((current) => ({
       ...current,
       kiraWorkspaceRoot: info.root,
@@ -703,6 +769,7 @@ function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose
     const info = await window.desktopAPI.pickWorkspace();
     if (!info) return;
     onWorkspaceChange(info);
+    void onTrustRefresh();
     setForm((current) => ({
       ...current,
       kiraWorkspaceRoot: info.root,
@@ -792,6 +859,26 @@ function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose
         </div>
 
         <div className="settings-body">
+          <div className="settings-section compact setup-section">
+            <div className="settings-section-header">
+              <span>Quick Setup</span>
+            </div>
+            <div className="setup-grid">
+              <div className={`setup-step ${form.apiKey ? "ok" : "warn"}`}>
+                <b>1</b>
+                <span>{form.apiKey ? "API key ready" : "Add API key"}</span>
+              </div>
+              <div className={`setup-step ${workspace?.projectDir ? "ok" : "warn"}`}>
+                <b>2</b>
+                <span>{workspace?.projectDir ? "Workspace ready" : "Choose workspace"}</span>
+              </div>
+              <div className="setup-step muted">
+                <b>3</b>
+                <span>Computer Use optional</span>
+              </div>
+            </div>
+          </div>
+
           <label className="settings-label">
             <span>Theme</span>
             <div className="settings-theme-row">
@@ -804,6 +891,41 @@ function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose
                 onClick={() => setForm({ ...form, theme: "light" })}
               >Light</button>
             </div>
+          </label>
+
+          <div className="settings-section compact">
+            <div className="settings-section-header">
+              <span>Mac Permissions</span>
+              <button className="settings-mini-btn" onClick={() => void onTrustRefresh()}>Refresh</button>
+            </div>
+            <div className="permission-grid">
+              <div>
+                <b>Screen Recording</b>
+                <span className={`permission-state ${trustTone(permissionOk(trustStatus?.permissions.screen))}`}>
+                  {permissionLabel(trustStatus?.permissions.screen)}
+                </span>
+                <button className="settings-mini-btn" onClick={() => window.desktopAPI.openPermissionSettings("screen")}>Open</button>
+              </div>
+              <div>
+                <b>Accessibility</b>
+                <span className={`permission-state ${trustTone(permissionOk(trustStatus?.permissions.accessibility))}`}>
+                  {permissionLabel(trustStatus?.permissions.accessibility)}
+                </span>
+                <button className="settings-mini-btn" onClick={() => window.desktopAPI.openPermissionSettings("accessibility")}>Open</button>
+              </div>
+            </div>
+            <span className="settings-note">macOS may cache permission status after app updates. If Computer Use cannot observe or control the desktop, enable both permissions in System Settings and restart Kira.</span>
+          </div>
+
+          <label className="settings-label">
+            <span>Computer Use Deny List</span>
+            <input
+              className="settings-input"
+              value={form.computerUseDeniedBundleIds ?? ""}
+              onChange={(e) => setForm({ ...form, computerUseDeniedBundleIds: e.target.value })}
+              placeholder='["com.example.App"] or comma-separated bundle IDs'
+            />
+            <span className="settings-note">Apps in this list cannot be granted Computer Use access. Use bundle IDs, for example com.apple.Music.</span>
           </label>
 
           <div className="settings-section compact">
@@ -926,36 +1048,35 @@ function SettingsPanel({ settings, workspace, onWorkspaceChange, onSave, onClose
               </div>
             )}
           </label>
-        </div>
+          {/* MCP Servers */}
+          <McpSection />
 
-        {/* MCP Servers */}
-        <McpSection />
-
-        {/* Remote Access */}
-        <div className="settings-section">
-          <div className="settings-section-header">
-            <span>Remote Access</span>
-            <button className={`remote-toggle ${remote.running ? "active" : ""}`} onClick={toggleRemote} disabled={remoteLoading}>
-              {remoteLoading ? "..." : remote.running ? "ON" : "OFF"}
-            </button>
+          {/* Remote Access */}
+          <div className="settings-section">
+            <div className="settings-section-header">
+              <span>Remote Access</span>
+              <button className={`remote-toggle ${remote.running ? "active" : ""}`} onClick={toggleRemote} disabled={remoteLoading}>
+                {remoteLoading ? "..." : remote.running ? "ON" : "OFF"}
+              </button>
+            </div>
+            {remote.running && remote.accessUrl && (
+              <div className="remote-info">
+                <div className="remote-qr" dangerouslySetInnerHTML={{ __html: remote.qrSvg || "" }} />
+                <p className="remote-url">{remote.accessUrl}</p>
+                <p className="remote-hint">{remote.publicUrl ? "公网可访问" : "仅局域网（手机需在同一 WiFi）"}</p>
+              </div>
+            )}
+            {remote.running && !remote.accessUrl && (
+              <p className="remote-hint">启动中...</p>
+            )}
           </div>
-          {remote.running && remote.accessUrl && (
-            <div className="remote-info">
-              <div className="remote-qr" dangerouslySetInnerHTML={{ __html: remote.qrSvg || "" }} />
-              <p className="remote-url">{remote.accessUrl}</p>
-              <p className="remote-hint">{remote.publicUrl ? "公网可访问" : "仅局域网（手机需在同一 WiFi）"}</p>
+
+          {testResult && (
+            <div className={`test-result ${testResult.ok ? "test-ok" : "test-fail"}`}>
+              {testResult.ok ? "✓ " : "✗ "}{testResult.message}
             </div>
           )}
-          {remote.running && !remote.accessUrl && (
-            <p className="remote-hint">启动中...</p>
-          )}
         </div>
-
-        {testResult && (
-          <div className={`test-result ${testResult.ok ? "test-ok" : "test-fail"}`}>
-            {testResult.ok ? "✓ " : "✗ "}{testResult.message}
-          </div>
-        )}
 
         <div className="settings-footer">
           <button className="settings-test" onClick={testConn} disabled={testing || !form.apiKey}>

@@ -3,9 +3,13 @@ import { WebSearchConfig } from "../config.ts";
 import {
   executeRegisteredTool,
   executeRegisteredTools,
+  type BuiltinToolDefinitionOptions,
   getBuiltinToolDefinitions,
-  SubAgentRequest,
-  SubAgentResult,
+  type ComputerUseTeachStepResolver,
+  type ComputerUseContext,
+  type SubAgentRequest,
+  type SubAgentResult,
+  type ToolApprovalDecision,
   ToolPermissionMode
 } from "../tools/registry.ts";
 import { UserQuestionResolver } from "../tools/user-question.ts";
@@ -24,6 +28,10 @@ export type { ToolPermissionMode };
 
 export const BUILTIN_AGENT_TOOLS: MagiToolDefinition[] = getBuiltinToolDefinitions();
 
+export function getBuiltinAgentTools(options: BuiltinToolDefinitionOptions = {}): MagiToolDefinition[] {
+  return getBuiltinToolDefinitions(options);
+}
+
 export async function executeBuiltinAgentTool(input: {
   cwd: string;
   toolUse: MagiToolUsePart;
@@ -40,7 +48,13 @@ export async function executeBuiltinAgentTool(input: {
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
-  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: { decision: "allow" | "ask" | "deny"; reason: string; diff?: string } }) => Promise<boolean> | boolean;
+  signal?: AbortSignal;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseDeniedBundleIds?: string[];
+  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: { decision: "allow" | "ask" | "deny"; reason: string; diff?: string } }) => Promise<ToolApprovalDecision> | ToolApprovalDecision;
 }): Promise<AgentToolResult> {
   return executeRegisteredTool({
     cwd: input.cwd,
@@ -58,6 +72,12 @@ export async function executeBuiltinAgentTool(input: {
     userQuestionResolver: input.userQuestionResolver,
     userMessageSink: input.userMessageSink,
     spawnSubAgent: input.spawnSubAgent,
+    signal: input.signal,
+    computerUseTeachStepResolver: input.computerUseTeachStepResolver,
+    computerUseHideHostWindow: input.computerUseHideHostWindow,
+    computerUseTeachModeActivated: input.computerUseTeachModeActivated,
+    computerUseTeachModeExited: input.computerUseTeachModeExited,
+    computerUseDeniedBundleIds: input.computerUseDeniedBundleIds,
     approvalResolver: input.approvalResolver
   });
 }
@@ -78,7 +98,13 @@ export async function executeBuiltinAgentTools(input: {
   userQuestionResolver?: UserQuestionResolver;
   userMessageSink?: UserMessageSink;
   spawnSubAgent?: (request: SubAgentRequest) => Promise<SubAgentResult>;
-  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: { decision: "allow" | "ask" | "deny"; reason: string; diff?: string } }) => Promise<boolean> | boolean;
+  signal?: AbortSignal;
+  computerUseTeachStepResolver?: ComputerUseTeachStepResolver;
+  computerUseHideHostWindow?: ComputerUseContext["hideHostWindow"];
+  computerUseTeachModeActivated?: ComputerUseContext["teachModeActivated"];
+  computerUseTeachModeExited?: ComputerUseContext["teachModeExited"];
+  computerUseDeniedBundleIds?: string[];
+  approvalResolver?: (request: { toolUse: MagiToolUsePart; permission: { decision: "allow" | "ask" | "deny"; reason: string; diff?: string } }) => Promise<ToolApprovalDecision> | ToolApprovalDecision;
 }): Promise<AgentToolResult[]> {
   return executeRegisteredTools({
     cwd: input.cwd,
@@ -96,6 +122,12 @@ export async function executeBuiltinAgentTools(input: {
     userQuestionResolver: input.userQuestionResolver,
     userMessageSink: input.userMessageSink,
     spawnSubAgent: input.spawnSubAgent,
+    signal: input.signal,
+    computerUseTeachStepResolver: input.computerUseTeachStepResolver,
+    computerUseHideHostWindow: input.computerUseHideHostWindow,
+    computerUseTeachModeActivated: input.computerUseTeachModeActivated,
+    computerUseTeachModeExited: input.computerUseTeachModeExited,
+    computerUseDeniedBundleIds: input.computerUseDeniedBundleIds,
     approvalResolver: input.approvalResolver
   });
 }

@@ -49,7 +49,9 @@ const api = {
 
   // App info
   getAppInfo: () => ipcRenderer.invoke("app:info"),
+  getTrustStatus: () => ipcRenderer.invoke("app:trust-status"),
   openExternal: (url: string) => ipcRenderer.invoke("app:open-external", url),
+  openPermissionSettings: (pane: "screen" | "accessibility") => ipcRenderer.invoke("app:open-permission-settings", pane),
 
   // Events (renderer ← main)
   onStreamEvent: (callback: (event: any) => void) => {

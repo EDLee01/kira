@@ -5,10 +5,14 @@ directories:
   buildResources: build
 asar: true
 files:
-  - dist/**/*
+  - dist/main/**/*
+  - dist/preload/**/*
+  - dist/renderer/**/*
   - package.json
   - node_modules/**/*
 extraResources:
+  - from: runtime
+    to: runtime
   - from: build/icon.png
     to: build/icon.png
   - from: build/icon.ico

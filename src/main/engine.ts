@@ -2,7 +2,7 @@
  * Engine wrapper — bridges magi-next's runAgentQuery to Electron IPC.
  * Runs in the main process.
  */
-import { BrowserWindow, dialog } from "electron";
+import { BrowserWindow } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
 import { MagiContentPart, textMessage } from "../core/providers/ir.ts";
 import { McpServerConfig } from "../core/config.ts";
@@ -13,8 +13,13 @@ import { buildLayeredContext } from "../core/context/layers.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
 import { buildSystemInstructions } from "../core/agent/system-prompt.ts";
 import { getBuiltinToolDefinitions } from "../core/tools/registry.ts";
+import { executeComputerUse, previewComputerUseApproval, releaseComputerUseSession, resetComputerUseTurnState, restoreComputerUseClipboard, restoreComputerUseHiddenApps } from "../core/tools/computer-use.ts";
+import type { ComputerUseTeachStepRequest } from "../core/tools/computer-use.ts";
 import { buildKiraWorkspaceEnv, defaultKiraWorkspaceRoot, ensureKiraWorkspace } from "../core/kira-workspace.ts";
 import { buildDesktopProvider } from "./desktop-provider";
+import { closeApprovalOverlay, showApprovalOverlay, type ApprovalOverlayRequest } from "./approval-overlay";
+import { closeTeachOverlay, showTeachOverlay } from "./teach-overlay";
+import { readDesktopSettings } from "./settings-store";
 
 export class Engine {
   private abortController: AbortController | null = null;
@@ -26,6 +31,7 @@ export class Engine {
   private win: BrowserWindow;
   private store: SessionStore;
   private _listeners: Array<(event: string, data: unknown) => void> = [];
+  private teachModeHidWindow = false;
 
   constructor(win: BrowserWindow, store: SessionStore) {
     this.win = win;
@@ -84,6 +90,7 @@ export class Engine {
       const paths = getMagiPaths(process.env);
       const runtime = this.buildProvider(paths);
       const { adapter, model, providerName, env } = runtime;
+      const settings = readDesktopSettings(paths);
       const workspaceEnv = buildKiraWorkspaceEnv({
         root: this._kiraWorkspaceRoot,
         projectDir: this._cwd,
@@ -181,58 +188,69 @@ export class Engine {
         stateRoot: paths.stateRoot,
         outputRoot: ensureKiraWorkspace(this._kiraWorkspaceRoot).artifactsRoot,
         kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        computerUseDeniedBundleIds: parseStringArraySetting(settings.computerUseDeniedBundleIds),
         sessionId,
         signal: this.abortController.signal,
         permissionMode: "auto",
         approvalResolver: async ({ toolUse, reason }) => {
-          let title = "Allow Kira to continue?";
-          let message = "Kira wants to perform an action that needs approval.";
-          let detail = reason;
+          let request: ApprovalOverlayRequest;
 
-          if (toolUse.name === "ComputerUse") {
-            title = "Allow Kira to control the computer?";
-            message = "Kira wants to perform a desktop action.";
-            detail = [
-              reason,
-              "",
-              `Action: ${String(toolUse.input.action ?? "")}`,
-              toolUse.input.x !== undefined || toolUse.input.y !== undefined ? `Coordinates: (${toolUse.input.x ?? "?"}, ${toolUse.input.y ?? "?"})` : undefined,
-              toolUse.input.text !== undefined ? `Text: ${String(toolUse.input.text).slice(0, 200)}` : undefined,
-              Array.isArray(toolUse.input.keys) ? `Keys: ${toolUse.input.keys.join("+")}` : undefined,
-              toolUse.input.key !== undefined ? `Key: ${String(toolUse.input.key)}` : undefined
-            ].filter((line): line is string => Boolean(line)).join("\n");
+          const computerUseInput = normalizeComputerUseToolInput(toolUse.name, toolUse.input);
+          if (computerUseInput) {
+            const action = computerUseInput.action;
+            const isTeachAccess = action === "request_teach_access";
+            const computerUsePreview = await this.computerUseApprovalPreview(computerUseInput);
+            request = {
+              title: isTeachAccess ? "Allow Kira to guide you?" : "Allow Kira to control the computer?",
+              message: isTeachAccess
+                ? "Kira is requesting permission to show a step-by-step guide. The main window will hide and a teaching overlay will appear."
+                : action === "request_access"
+                ? "Kira is requesting access to desktop apps."
+                : "Kira wants to perform a desktop action.",
+              reason: [
+                reason,
+                computerUseInput.reason !== undefined ? String(computerUseInput.reason).slice(0, 300) : undefined,
+                isTeachAccess
+                  ? "Approve only if you want Kira to enter teaching mode for this task. Each step waits for your Next or Exit choice."
+                  : "Coordinates are pixels from Kira's latest screenshot; Kira handles display scaling."
+              ].filter((line): line is string => Boolean(line)).join("\n\n"),
+              toolUse,
+              kind: "computer-use",
+              computerUsePreview
+            };
           } else if (toolUse.name === "Bash") {
-            title = "Allow Kira to run this command?";
-            message = "Kira wants to run a command that may install software or change system state.";
-            detail = [
+            request = {
+              title: "Allow Kira to run this command?",
+              message: "Kira wants to run a command that may install software or change system state.",
               reason,
-              "",
-              `Command: ${String(toolUse.input.command ?? "").slice(0, 1000)}`
-            ].join("\n");
+              toolUse,
+              kind: "command"
+            };
           } else if (toolUse.name === "KillProcess") {
-            title = "Allow Kira to close this process?";
-            message = "Kira wants to terminate a running process.";
-            detail = [
+            request = {
+              title: "Allow Kira to close this process?",
+              message: "Kira wants to terminate a running process.",
               reason,
-              "",
-              toolUse.input.pid !== undefined ? `PID: ${String(toolUse.input.pid)}` : undefined,
-              toolUse.input.name !== undefined ? `Name: ${String(toolUse.input.name).slice(0, 300)}` : undefined,
-              toolUse.input.signal !== undefined ? `Signal: ${String(toolUse.input.signal)}` : undefined
-            ].filter((line): line is string => Boolean(line)).join("\n");
+              toolUse,
+              kind: "process"
+            };
           } else {
             return false;
           }
 
-          const result = await dialog.showMessageBox(this.win, {
-            type: "warning",
-            buttons: ["Allow", "Deny"],
-            defaultId: 1,
-            cancelId: 1,
-            title,
-            message,
-            detail
-          });
-          return result.response === 0;
+          return showApprovalOverlay(this.win, request, this.abortController?.signal);
+        },
+        computerUseTeachStepResolver: async (request: ComputerUseTeachStepRequest) => {
+          return showTeachOverlay(this.win, request, this.abortController?.signal);
+        },
+        computerUseHideHostWindow: () => {
+          this.hideMainWindowForComputerUse();
+        },
+        computerUseTeachModeActivated: () => {
+          this.hideMainWindowForTeachMode();
+        },
+        computerUseTeachModeExited: () => {
+          this.restoreMainWindowFromTeachMode();
         },
         mcp: mcpConfig,
         onStreamEvent: (ev) => {
@@ -267,6 +285,29 @@ export class Engine {
         });
       }
     } finally {
+      closeApprovalOverlay();
+      closeTeachOverlay();
+      await restoreComputerUseHiddenApps({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId
+      });
+      await restoreComputerUseClipboard({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId
+      });
+      await releaseComputerUseSession({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId
+      });
+      resetComputerUseTurnState({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId
+      });
+      this.restoreMainWindowFromTeachMode();
       this._running = false;
       this._sessionId = null;
       this.abortController = null;
@@ -277,6 +318,31 @@ export class Engine {
   cancelQuery(): void {
     this.abortController?.abort();
     this.abortController = null;
+    closeApprovalOverlay();
+    closeTeachOverlay();
+    if (this._sessionId) {
+      void restoreComputerUseHiddenApps({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId: this._sessionId
+      });
+      void restoreComputerUseClipboard({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId: this._sessionId
+      });
+      void releaseComputerUseSession({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId: this._sessionId
+      });
+      resetComputerUseTurnState({
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId: this._sessionId
+      });
+    }
+    this.restoreMainWindowFromTeachMode();
   }
 
   canStartQuery(): boolean {
@@ -302,7 +368,91 @@ export class Engine {
     }
     return runtime;
   }
+
+  private hideMainWindowForTeachMode(): void {
+    this.hideMainWindowForComputerUse();
+  }
+
+  private hideMainWindowForComputerUse(): void {
+    if (this.win.isDestroyed() || this.teachModeHidWindow) return;
+    if (!this.win.isVisible()) return;
+    this.teachModeHidWindow = true;
+    this.win.hide();
+  }
+
+  private restoreMainWindowFromTeachMode(): void {
+    if (!this.teachModeHidWindow) return;
+    this.teachModeHidWindow = false;
+    if (this.win.isDestroyed()) return;
+    this.win.show();
+    this.win.focus();
+  }
+
+  private async computerUseApprovalPreview(input: Record<string, unknown>) {
+    try {
+      return await previewComputerUseApproval(input, {
+        cwd: this._cwd,
+        kiraWorkspaceRoot: this._kiraWorkspaceRoot,
+        sessionId: this._sessionId ?? undefined,
+        signal: this.abortController?.signal
+      });
+    } catch {
+      return undefined;
+    }
+  }
 }
+
+function parseStringArraySetting(value: string | undefined): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+}
+
+function normalizeComputerUseToolInput(toolName: string, input: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (toolName === "ComputerUse") return input;
+  const action = COMPUTER_USE_TOOL_ACTIONS[toolName];
+  return action ? { ...input, action } : undefined;
+}
+
+const COMPUTER_USE_TOOL_ACTIONS: Record<string, string> = {
+  request_access: "request_access",
+  screenshot: "screenshot",
+  zoom: "zoom",
+  display_info: "display_info",
+  switch_display: "switch_display",
+  permissions: "permissions",
+  cursor_position: "cursor_position",
+  frontmost_app: "frontmost_app",
+  app_under_point: "app_under_point",
+  left_click: "click",
+  double_click: "double_click",
+  triple_click: "triple_click",
+  right_click: "right_click",
+  middle_click: "middle_click",
+  mouse_move: "move",
+  left_click_drag: "drag",
+  scroll: "scroll",
+  type: "type",
+  key: "key",
+  hold_key: "hold_key",
+  left_mouse_down: "left_mouse_down",
+  left_mouse_up: "left_mouse_up",
+  open_application: "open_app",
+  list_granted_applications: "list_granted_apps",
+  list_running_applications: "list_running_apps",
+  list_installed_applications: "list_installed_apps",
+  read_clipboard: "read_clipboard",
+  write_clipboard: "write_clipboard",
+  wait: "wait",
+  computer_batch: "batch",
+  request_teach_access: "request_teach_access",
+  teach_step: "teach_step",
+  teach_batch: "teach_batch"
+};
 
 function hasRuntimeApiKey(runtime: ReturnType<typeof buildDesktopProvider>): boolean {
   if (runtime.providerName === "anthropic") {
