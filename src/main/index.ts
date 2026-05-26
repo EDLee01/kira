@@ -3,7 +3,7 @@ import path from "path";
 import { registerIPC, unregisterIPC } from "./ipc";
 import { startScheduler } from "./scheduler";
 import { SessionStore } from "../core/session-store.ts";
-import { getMagiPaths } from "../core/paths.ts";
+import { ensureMagiHome, getMagiPaths } from "../core/paths.ts";
 import { buildDesktopProvider } from "./desktop-provider";
 import { readDesktopSettings, readKiraWorkspaceRoot } from "./settings-store";
 import { buildKiraWorkspaceInfo, defaultProjectDir } from "../core/kira-workspace.ts";
@@ -23,6 +23,8 @@ function readSchedulerWorkspaceRoot(): string {
 }
 
 function createWindow(): void {
+  const paths = getMagiPaths(process.env);
+  ensureMagiHome(paths);
   const appIcon = app.isPackaged
     ? path.join(process.resourcesPath, "build", process.platform === "win32" ? "icon.ico" : "icon.png")
     : path.join(__dirname, "..", "..", "build", process.platform === "win32" ? "icon.ico" : "icon.png");
@@ -45,7 +47,6 @@ function createWindow(): void {
   registerIPC(mainWindow);
 
   // Start background scheduler
-  const paths = getMagiPaths(process.env);
   const store = SessionStore.open(paths);
   stopScheduler = startScheduler({
     store,

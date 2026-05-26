@@ -29,23 +29,26 @@ export interface RuntimeSettings {
 }
 
 export function getMagiPaths(env: NodeJS.ProcessEnv = process.env, homeDir = os.homedir()): MagiPaths {
-  const root = env.MAGI_CONFIG_DIR
-    ? path.resolve(env.MAGI_CONFIG_DIR)
-    : path.join(homeDir, DEVELOPMENT_ROOT_NAME);
+  const rawRoot = env.MAGI_CONFIG_DIR?.trim();
+  const pathApi = selectPathApi(env, rawRoot, homeDir, env.USERPROFILE, env.HOME);
+  const home = resolveHomeDir(env, homeDir, pathApi);
+  const root = rawRoot
+    ? pathApi.resolve(repairMissingRootSeparator(rawRoot, [homeDir, env.USERPROFILE, env.HOME], pathApi))
+    : pathApi.join(home, DEVELOPMENT_ROOT_NAME);
 
-  const stateRoot = path.join(root, "state");
+  const stateRoot = pathApi.join(root, "state");
 
   return {
     root,
-    configFile: path.join(root, "config.yaml"),
+    configFile: pathApi.join(root, "config.yaml"),
     stateRoot,
-    sessionsRoot: path.join(root, "sessions"),
-    logsRoot: path.join(root, "logs"),
-    cacheRoot: path.join(root, "cache"),
-    pluginsRoot: path.join(root, "plugins"),
-    skillsRoot: path.join(root, "skills"),
-    devicesRoot: path.join(root, "devices"),
-    sessionDbFile: path.join(stateRoot, "sessions.sqlite")
+    sessionsRoot: pathApi.join(root, "sessions"),
+    logsRoot: pathApi.join(root, "logs"),
+    cacheRoot: pathApi.join(root, "cache"),
+    pluginsRoot: pathApi.join(root, "plugins"),
+    skillsRoot: pathApi.join(root, "skills"),
+    devicesRoot: pathApi.join(root, "devices"),
+    sessionDbFile: pathApi.join(stateRoot, "sessions.sqlite")
   };
 }
 
@@ -127,4 +130,57 @@ function parseControlPort(raw: string | undefined): number {
   }
 
   return port;
+}
+
+type PathApi = Pick<typeof path, "join" | "normalize" | "resolve">;
+
+function selectPathApi(env: NodeJS.ProcessEnv, ...values: Array<string | undefined>): PathApi {
+  if (env.OS === "Windows_NT" || values.some((value) => value !== undefined && isWindowsPath(value))) {
+    return path.win32;
+  }
+  return path;
+}
+
+function resolveHomeDir(env: NodeJS.ProcessEnv, homeDir: string, pathApi: PathApi): string {
+  const candidates = [homeDir, env.USERPROFILE, env.HOME]
+    .map((candidate) => candidate?.trim())
+    .filter((candidate): candidate is string => Boolean(candidate));
+
+  if (pathApi === path.win32) {
+    return candidates.find(isWindowsPath) ?? candidates[0] ?? ".";
+  }
+  return candidates[0] ?? ".";
+}
+
+function repairMissingRootSeparator(rawRoot: string, homeCandidates: Array<string | undefined>, pathApi: PathApi): string {
+  const normalizedRoot = stripTrailingSeparators(pathApi.normalize(rawRoot.trim()));
+  const rootNames = [DEVELOPMENT_ROOT_NAME, FUTURE_STABLE_ROOT_NAME];
+  for (const candidate of homeCandidates) {
+    const rawHome = candidate?.trim();
+    if (!rawHome) continue;
+    const normalizedHome = stripTrailingSeparators(pathApi.normalize(rawHome));
+    for (const rootName of rootNames) {
+      if (samePath(normalizedRoot, `${normalizedHome}${rootName}`, pathApi)) {
+        return pathApi.join(normalizedHome, rootName);
+      }
+    }
+  }
+  return rawRoot;
+}
+
+function stripTrailingSeparators(value: string): string {
+  return value.replace(/[\\/]+$/, "");
+}
+
+function samePath(left: string, right: string, pathApi: PathApi): boolean {
+  const normalizedLeft = pathApi.normalize(left);
+  const normalizedRight = pathApi.normalize(right);
+  if (pathApi === path.win32) {
+    return normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
+  }
+  return normalizedLeft === normalizedRight;
+}
+
+function isWindowsPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
 }
