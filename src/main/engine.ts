@@ -13,6 +13,10 @@ import { buildLayeredContext } from "../core/context/layers.ts";
 import { formatGoalContext, getGoal } from "../core/goal.ts";
 import { buildSystemInstructions } from "../core/agent/system-prompt.ts";
 import { formatMemoryContext, retrieveRelevantMemory } from "../core/memory-search.ts";
+import { extractExplicitMemoryWrite, MemoryScope } from "../core/memory.ts";
+import { proposeMemoryDraft } from "../core/memory-draft.ts";
+import { readMemdirIndex, searchMemdir } from "../core/memdir.ts";
+import { selectRelevantMemories } from "../core/memory-selection.ts";
 import { getBuiltinToolDefinitions } from "../core/tools/registry.ts";
 import { executeComputerUse, previewComputerUseApproval, releaseComputerUseSession, resetComputerUseTurnState, restoreComputerUseClipboard, restoreComputerUseHiddenApps } from "../core/tools/computer-use.ts";
 import type { ComputerUseTeachStepRequest } from "../core/tools/computer-use.ts";
@@ -139,7 +143,13 @@ export class Engine {
       // Build messages: prepend summary if exists, then recent messages
       const messages: any[] = [];
       const goalContext = formatGoalContext(getGoal(paths, sessionId));
-      const durableMemoryContext = this.buildDurableMemoryContext(paths, userMessage, sessionId);
+      const durableMemoryContext = await this.buildDurableMemoryContext({
+        paths,
+        userMessage,
+        sessionId,
+        adapter,
+        providerName
+      });
       const memoryContext = [goalContext, durableMemoryContext].filter(Boolean).join("\n\n") || undefined;
       const { systemPrompt } = buildLayeredContext({
         cwd: this._cwd,
@@ -395,23 +405,123 @@ export class Engine {
     this.win.focus();
   }
 
-  private buildDurableMemoryContext(paths: MagiPaths, userMessage: string, sessionId: string): string {
+  private async buildDurableMemoryContext(input: {
+    paths: MagiPaths;
+    userMessage: string;
+    sessionId: string;
+    adapter: ReturnType<typeof buildDesktopProvider>["adapter"];
+    providerName: string;
+  }): Promise<string> {
     try {
-      const config = loadConfig(paths);
+      const config = loadConfig(input.paths);
       if (!config.memory.enabled) {
         return "";
       }
+      this.handleExplicitMemoryWrite(input);
+      const sections: string[] = [];
       const hits = retrieveRelevantMemory({
-        appRoot: paths.root,
+        appRoot: input.paths.root,
         root: config.memory.root,
-        query: userMessage,
+        query: input.userMessage,
         maxResults: config.memory.maxResults,
-        sessionId
+        sessionId: input.sessionId
       });
-      return formatMemoryContext(hits);
+      const formalMemoryContext = formatMemoryContext(hits);
+      if (formalMemoryContext) {
+        sections.push(formalMemoryContext);
+      }
+
+      const memdirIndex = readMemdirIndex({ root: input.paths.root });
+      if (memdirIndex.trim()) {
+        sections.push(`[Memory Wiki Index]\n${memdirIndex.trim()}`);
+      }
+
+      const memdirMatches = searchMemdir({
+        paths: { root: input.paths.root },
+        query: input.userMessage,
+        maxResults: Math.min(5, config.memory.maxResults)
+      });
+      if (memdirMatches.length > 0) {
+        const lines = ["[Relevant Memory Wiki Pages]"];
+        for (const entry of memdirMatches) {
+          lines.push(`## ${entry.name} (${entry.type})`);
+          lines.push(entry.description);
+          if (entry.body) {
+            lines.push(entry.body.length > 600 ? `${entry.body.slice(0, 600)}...` : entry.body);
+          }
+          lines.push("");
+        }
+        sections.push(lines.join("\n").trim());
+      }
+
+      const selectionRoute = config.memory.selectionModel
+        ? {
+            adapter: input.adapter,
+            model: config.memory.selectionModel,
+            providerName: input.providerName
+          }
+        : undefined;
+      const selected = await selectRelevantMemories({
+        paths: input.paths,
+        cwd: this._cwd,
+        sessionId: input.sessionId,
+        scopes: config.memory.scopes,
+        maxResults: config.memory.maxResults,
+        prompt: input.userMessage,
+        selectionRoute,
+        signal: this.abortController?.signal
+      });
+      if (selected.formatted) {
+        sections.push(selected.formatted);
+      }
+      this.store.recordAudit({
+        sessionId: input.sessionId,
+        action: "memory.retrieved",
+        target: input.sessionId,
+        metadata: {
+          formalHitCount: hits.length,
+          memdirHitCount: memdirMatches.length,
+          legacyHitCount: selected.entries.length,
+          legacySelectionMethod: selected.method
+        }
+      });
+      return sections.join("\n\n");
     } catch {
       return "";
     }
+  }
+
+  private handleExplicitMemoryWrite(input: {
+    paths: MagiPaths;
+    userMessage: string;
+    sessionId: string;
+  }): void {
+    const config = loadConfig(input.paths);
+    if (!config.memory.enabled || config.memory.autoWrite === "off") {
+      return;
+    }
+    const write = extractExplicitMemoryWrite(input.userMessage);
+    if (!write) {
+      return;
+    }
+    const draft = proposeMemoryDraft({
+      appRoot: input.paths.root,
+      root: config.memory.root,
+      targetFile: explicitMemoryTargetFile(write.scope),
+      content: formatExplicitMemoryDraft(write),
+      reason: `Explicit user Memory request for ${write.scope}`,
+      sourceSession: input.sessionId,
+      confidence: 1
+    });
+    this.store.recordAudit({
+      sessionId: input.sessionId,
+      action: "memory.draft.created",
+      target: draft.targetFile,
+      metadata: {
+        scope: write.scope,
+        draftId: draft.id
+      }
+    });
   }
 
   private async computerUseApprovalPreview(input: Record<string, unknown>) {
@@ -467,6 +577,26 @@ function normalizeComputerUseToolInput(toolName: string, input: Record<string, u
   if (toolName === "ComputerUse") return input;
   const action = COMPUTER_USE_TOOL_ACTIONS[toolName];
   return action ? { ...input, action } : undefined;
+}
+
+function explicitMemoryTargetFile(scope: MemoryScope): string {
+  if (scope === "user") return "user.md";
+  if (scope === "project") return "projects/default.md";
+  return "sessions/README.md";
+}
+
+function formatExplicitMemoryDraft(write: { scope: MemoryScope; text: string }): string {
+  return [
+    `## ${explicitMemoryTitle(write.scope)}`,
+    "",
+    write.text.trim()
+  ].join("\n");
+}
+
+function explicitMemoryTitle(scope: MemoryScope): string {
+  if (scope === "user") return "User memory";
+  if (scope === "project") return "Project memory";
+  return "Session memory";
 }
 
 const COMPUTER_USE_TOOL_ACTIONS: Record<string, string> = {

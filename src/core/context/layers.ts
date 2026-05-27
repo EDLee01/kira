@@ -55,7 +55,7 @@ export function buildLayeredContext(input: ContextBuildInput): BuiltContext {
   // Layer 3: User memory index
   const memoryIndex = input.userMemoryIndex ?? loadUserMemoryIndex(input.paths);
   if (memoryIndex) {
-    layers.push({ name: "memory-index", content: `[User memory]\n${memoryIndex}` });
+    layers.push({ name: "memory-index", content: `[Memory index]\n${memoryIndex}` });
   }
 
   // Layer 4: Dynamic memory (selected relevant memories)
@@ -91,12 +91,22 @@ function loadUserMemoryIndex(paths?: MagiPaths): string | undefined {
   if (!paths) {
     return undefined;
   }
-  const indexFile = path.join(paths.root, "memory.md");
-  if (!existsSync(indexFile)) {
-    return undefined;
+  const candidates = [
+    path.join(paths.root, "memory", "INDEX.md"),
+    path.join(paths.root, "memdir", "MEMORY.md"),
+    path.join(paths.root, "memory.md")
+  ];
+  const sections: string[] = [];
+  for (const file of candidates) {
+    if (!existsSync(file)) {
+      continue;
+    }
+    const content = readFileSync(file, "utf8").trim();
+    if (content) {
+      sections.push(content);
+    }
   }
-  const content = readFileSync(indexFile, "utf8").trim();
-  return content || undefined;
+  return sections.join("\n\n") || undefined;
 }
 
 export function getGitContext(cwd: string): string | undefined {
