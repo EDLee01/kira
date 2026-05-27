@@ -4,6 +4,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { ensureKiraWorkspace } from "../kira-workspace.ts";
+import { callMacComputerUseBridge, isMacComputerUseBridgeAvailable } from "./mac-computer-use-bridge.ts";
 
 const PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple/";
 const PIP_TRUSTED_HOST = "pypi.tuna.tsinghua.edu.cn";
@@ -37,6 +38,16 @@ export async function callComputerUseHelper<T>(input: {
   signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<T> {
+  if (isMacComputerUseBridgeAvailable(input.command)) {
+    try {
+      return await callMacComputerUseBridge<T>(input.command, input.payload ?? {});
+    } catch (error) {
+      if (!canFallbackToPythonHelper(input.command)) {
+        throw error;
+      }
+    }
+  }
+
   const runtime = runtimePaths(input);
   await ensureBootstrapped(runtime, input.env, input.signal);
   const result = await execFileNoThrow(runtime.pythonBin, [
@@ -73,6 +84,16 @@ export async function callComputerUseHelperIfReady<T>(input: {
   signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<T | undefined> {
+  if (isMacComputerUseBridgeAvailable(input.command)) {
+    try {
+      return await callMacComputerUseBridge<T>(input.command, input.payload ?? {});
+    } catch (error) {
+      if (!canFallbackToPythonHelper(input.command)) {
+        return undefined;
+      }
+    }
+  }
+
   const runtime = runtimePaths(input);
   if (!(await isRuntimeReady(runtime))) return undefined;
   try {
@@ -93,6 +114,22 @@ export async function callComputerUseHelperIfReady<T>(input: {
   } catch {
     return undefined;
   }
+}
+
+function canFallbackToPythonHelper(command: string): boolean {
+  return command === "screenshot"
+    || command === "zoom"
+    || command === "validate_click_target"
+    || command === "resolve_prepare_capture"
+    || command === "frontmost_app"
+    || command === "app_under_point"
+    || command === "list_running_apps"
+    || command === "list_installed_apps"
+    || command === "open_app"
+    || command === "preview_hide_set"
+    || command === "prepare_for_action"
+    || command === "restore_apps"
+    || command === "find_window_displays";
 }
 
 function runtimePaths(input: { cwd: string; kiraWorkspaceRoot?: string }): RuntimePaths {

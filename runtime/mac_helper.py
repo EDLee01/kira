@@ -666,16 +666,19 @@ def write_clipboard(text: str) -> None:
 
 
 def paste_clipboard() -> None:
-    send_keystroke_via_osascript("v", ["command"])
+    try:
+        pyautogui.hotkey("command", "v", interval=0.02)
+    except Exception:
+        send_keystroke_via_osascript("v", ["command"])
 
 
 def paste_text(text: str) -> None:
     original = read_clipboard()
     try:
         write_clipboard(text)
-        time.sleep(0.04)
+        time.sleep(0.08)
         paste_clipboard()
-        time.sleep(0.18)
+        time.sleep(0.35)
     finally:
         try:
             write_clipboard(original)

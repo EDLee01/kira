@@ -199,12 +199,14 @@ interface ScreenshotResult {
   display?: DisplayGeometry;
   monitorNote?: string;
   filePath?: string;
+  backend?: string;
 }
 
 interface ZoomResult {
   base64: string;
   width: number;
   height: number;
+  backend?: string;
 }
 
 type Point = { x: number; y: number };
@@ -404,7 +406,7 @@ export const ComputerUseInputSchema = {
       minItems: 2,
       maxItems: 2,
       items: { type: "number" },
-      description: "Magi-compatible [x, y] coordinate tuple. Equivalent to x/y; for left_click_drag this is the end coordinate."
+      description: "Magi-compatible [x, y] coordinate tuple. Equivalent to x/y; for type this focuses the target field before typing, and for left_click_drag this is the end coordinate."
     },
     start_coordinate: {
       type: "array",
@@ -458,11 +460,11 @@ export const ComputerUseInputSchema = {
     },
     viaClipboard: {
       type: "boolean",
-      description: "For type, force clipboard paste when true. If omitted, Kira uses the clipboard only when clipboardWrite was granted and paste is the more reliable path for the current platform/text."
+      description: "For type, force clipboard paste when true. If omitted, Kira uses the clipboard only when clipboardWrite was granted and paste is the more reliable path for the current platform/text. On macOS, request clipboardWrite once when entering normal text into apps like WeChat."
     },
     includePostActionScreenshot: {
       type: "boolean",
-      description: "For controlling actions, include a fresh screenshot after the action. Defaults to false. Teach steps return their own final screenshot when actions run."
+      description: "For controlling actions, include a fresh screenshot after the action. Defaults to true on Windows controlling actions and false elsewhere. Teach steps return their own final screenshot when actions run."
     },
     durationMs: {
       type: "number",
@@ -931,12 +933,26 @@ async function executeComputerUseUnlocked(
       if (scrollState.held) scrollState.moved = true;
       return withOptionalPostActionScreenshot(withPolicyNote(`Scrolled at (${input.x}, ${input.y}) by (${input.deltaX ?? 0}, ${input.deltaY ?? 0}).`, scrollPolicy), input, context);
     case "type":
-      const typePolicy = await enforceInputPolicy(input, context, "keyboard");
+      const typePoint = input.x === undefined && input.y === undefined
+        ? undefined
+        : scalePoint(input.x ?? 0, input.y ?? 0, context);
+      const typePolicy = await enforceInputPolicy(input, context, "keyboard", typePoint);
+      if (typePoint) {
+        await releaseHeldMouse(context);
+        await helper("click", {
+          x: typePoint.x,
+          y: typePoint.y,
+          button: "left",
+          count: 1,
+          modifiers: []
+        }, context);
+        await wait(MOVE_SETTLE_MS);
+      }
       const shouldUseClipboard = input.viaClipboard === true
         || (input.viaClipboard !== false && shouldUseClipboardForTyping(input.text ?? "", context));
       if (shouldUseClipboard) {
-        requireGrantFlag(context, "clipboardWrite", "Clipboard write is not granted. Request `clipboardWrite` via request_access.");
-        await helper("paste_text", { text: input.text ?? "" }, context);
+        requireGrantFlag(context, "clipboardWrite", missingClipboardWriteMessage());
+        await pasteTextViaClipboard(input.text ?? "", context);
       } else {
         await typeTextByGrapheme(input.text ?? "", context);
       }
@@ -963,7 +979,7 @@ async function executeComputerUseUnlocked(
       requireGrantFlag(context, "clipboardRead", "Clipboard read is not granted. Request `clipboardRead` via request_access.");
       return formatJson({ text: await readClipboardWithClickTierGuard(context) });
     case "write_clipboard":
-      requireGrantFlag(context, "clipboardWrite", "Clipboard write is not granted. Request `clipboardWrite` via request_access.");
+      requireGrantFlag(context, "clipboardWrite", missingClipboardWriteMessage());
       await assertClipboardWriteAllowed(context);
       const clipboardPolicy = await enforceInputPolicy(input, context, "keyboard");
       await helper("write_clipboard", { text: input.text ?? "" }, context);
@@ -1053,7 +1069,7 @@ async function withOptionalPostActionScreenshot(
   input: ComputerUseInput,
   context: ComputerUseContext
 ): Promise<string> {
-  if (input.includePostActionScreenshot !== true) return message;
+  if (!shouldIncludePostActionScreenshot(input)) return message;
   const screenshot = await takeScreenshot({ action: "screenshot", displayId: effectiveDisplayId(input, context), includeImage: input.includeImage }, context);
   return [
     message,
@@ -1061,6 +1077,30 @@ async function withOptionalPostActionScreenshot(
     "[Post-action screenshot]",
     formatScreenshot(screenshot, { action: "screenshot", includeImage: input.includeImage }, context.cwd)
   ].join("\n");
+}
+
+function shouldIncludePostActionScreenshot(input: ComputerUseInput): boolean {
+  if (input.includePostActionScreenshot === true) return true;
+  if (input.includePostActionScreenshot === false) return false;
+  return os.platform() === "win32" && shouldAutoVerifyWindowsAction(input.action);
+}
+
+function shouldAutoVerifyWindowsAction(action: ComputerUseAction): boolean {
+  return action === "open_app"
+    || action === "click"
+    || action === "double_click"
+    || action === "triple_click"
+    || action === "right_click"
+    || action === "middle_click"
+    || action === "drag"
+    || action === "left_mouse_down"
+    || action === "left_mouse_up"
+    || action === "scroll"
+    || action === "type"
+    || action === "key"
+    || action === "hold_key"
+    || action === "hotkey"
+    || action === "batch";
 }
 
 async function switchComputerUseDisplay(
@@ -1098,7 +1138,7 @@ async function leftMouseDown(
   await helper("mouse_down", {}, context);
   state.held = true;
   state.moved = false;
-  return withPolicyNote("Mouse button pressed.", policy);
+  return withOptionalPostActionScreenshot(withPolicyNote("Mouse button pressed.", policy), input, context);
 }
 
 async function leftMouseUp(
@@ -1121,7 +1161,7 @@ async function leftMouseUp(
   await helper("mouse_up", {}, context);
   state.held = false;
   state.moved = false;
-  return withPolicyNote("Mouse button released.", policy);
+  return withOptionalPostActionScreenshot(withPolicyNote("Mouse button released.", policy), input, context);
 }
 
 async function requestComputerUseAccess(
@@ -1150,6 +1190,7 @@ async function requestComputerUseAccess(
   const deniedAppKeys = approvalDeniedAppKeys(context.approvalResponse);
   const appsToEvaluate = approvedApps ?? requested;
   const approvedAppKeys = approvedApps ? buildApprovalAppKeySet(approvedApps, candidates) : undefined;
+  const approvedGrantOverrides = buildApprovalGrantOverrideMap(context.approvalResponse?.granted);
   const responseFlags = context.approvalResponse?.flags;
   if (responseFlags) {
     if (typeof responseFlags.clipboardRead === "boolean") flags.clipboardRead = responseFlags.clipboardRead;
@@ -1213,11 +1254,12 @@ async function requestComputerUseAccess(
       });
       continue;
     }
+    const approvedGrant = findApprovalGrantOverride(approvedGrantOverrides, appName, app);
     const grant: AppGrant = {
-      bundleId: app.bundleId,
-      displayName: app.displayName,
-      tier: getDefaultComputerUseTier(app),
-      grantedAt: new Date().toISOString()
+      bundleId: app.bundleId ?? approvedGrant?.bundleId,
+      displayName: approvedGrant?.displayName ?? app.displayName,
+      tier: approvedGrant?.tier ?? getDefaultComputerUseTier(app),
+      grantedAt: approvedGrant?.grantedAt ?? new Date().toISOString()
     };
     grantStore(context).set(grantKey(grant), grant);
     granted.push(grant);
@@ -1227,6 +1269,7 @@ async function requestComputerUseAccess(
   const policyDeniedGuidance = buildComputerUsePolicyDeniedGuidance(policyDenied);
   const userDeniedGuidance = buildComputerUseUserDeniedGuidance(userDenied);
   const tierGuidance = buildComputerUseTierGuidance(granted);
+  const tccResult = await recheckTccApprovalState(input, context);
 
   return formatJson({
     reason: input.reason ?? "No reason provided.",
@@ -1248,6 +1291,7 @@ async function requestComputerUseAccess(
     ...(tierGuidance ? { tierGuidance } : {}),
     screenshotFiltering: screenshotFilteringMode(),
     ...(windowLocations.length > 0 ? { windowLocations } : {}),
+    ...(tccResult ? { tcc: tccResult } : {}),
 	    ...(willHide.length > 0 ? {
 	      willHide,
 	      autoUnhideEnabled: true
@@ -1347,7 +1391,7 @@ async function executeComputerUseBatch(
   }
 
   setLastScreenshot(context, preBatchScreenshot);
-  return formatJson({ completed });
+  return withOptionalPostActionScreenshot(formatJson({ completed }), input, context);
 }
 
 async function executeComputerUseTeachStep(
@@ -1558,6 +1602,21 @@ async function readClipboardWithClickTierGuard(context: ComputerUseContext): Pro
   return helper<string>("read_clipboard", {}, context);
 }
 
+async function pasteTextViaClipboard(text: string, context: ComputerUseContext): Promise<void> {
+  const original = await helper<string>("read_clipboard", {}, context).catch(() => "");
+  try {
+    await helper("write_clipboard", { text }, context);
+    await wait(os.platform() === "darwin" ? 80 : 40);
+    await helper("key", {
+      keySequence: os.platform() === "darwin" ? "command+v" : "ctrl+v",
+      repeat: 1
+    }, context);
+    await wait(os.platform() === "darwin" ? 350 : 100);
+  } finally {
+    await helper("write_clipboard", { text: original }, context).catch(() => undefined);
+  }
+}
+
 async function assertClipboardWriteAllowed(context: ComputerUseContext): Promise<void> {
   const frontmost = await helper<AppInfo | null>("frontmost_app", {}, context).catch(() => null);
   const frontmostIsClickTier = frontmost ? findGrantForApp(frontmost, context)?.tier === "click" : false;
@@ -1652,6 +1711,14 @@ function requireGrantFlag(context: ComputerUseContext, flag: keyof ComputerUseGr
   if (!grantFlags(context)[flag]) {
     throw new ToolError(message, "approval-required");
   }
+}
+
+function missingClipboardWriteMessage(): string {
+  return [
+    "Clipboard write is not granted for this Computer Use session.",
+    "This is Kira's `clipboardWrite` grant flag, not a macOS Screen Recording or Accessibility permission.",
+    "Call request_access once for the target app with `clipboardWrite: true`; do not ask for macOS permissions again if they were already granted."
+  ].join(" ");
 }
 
 function grantFlags(context: ComputerUseContext): ComputerUseGrantFlags {
@@ -1854,6 +1921,35 @@ function buildApprovalAppKeySet(values: string[], candidates: AppInfo[]): Set<st
   return keys;
 }
 
+function buildApprovalGrantOverrideMap(grants: ComputerUseApprovalResponse["granted"]): Map<string, AppGrant> {
+  const map = new Map<string, AppGrant>();
+  for (const grant of grants ?? []) {
+    const keys = appApprovalKeys(grant);
+    for (const key of keys) {
+      map.set(key, grant);
+    }
+  }
+  return map;
+}
+
+function findApprovalGrantOverride(
+  grants: Map<string, AppGrant>,
+  requested: string,
+  app: AppInfo | undefined
+): AppGrant | undefined {
+  const keys = approvalKeysForValue(requested);
+  if (app) {
+    for (const key of appApprovalKeys(app)) {
+      keys.add(key);
+    }
+  }
+  for (const key of keys) {
+    const grant = grants.get(key);
+    if (grant) return grant;
+  }
+  return undefined;
+}
+
 function approvalKeySetHas(keys: Set<string> | undefined, requested: string, app: AppInfo | undefined): boolean {
   if (!keys || keys.size === 0) return false;
   return keys.has(normalizeApprovalName(requested))
@@ -1992,8 +2088,7 @@ function resolveGrantedApp(requested: string, context: ComputerUseContext): AppG
   const needle = requested.trim().toLowerCase();
   const requestedKeys = new Set([needle, ...approvalAliasesForKey(needle)]);
   return [...grantStore(context).values()].find((grant) =>
-    Boolean(grant.bundleId && requestedKeys.has(grant.bundleId.trim().toLowerCase()))
-    || Boolean(grant.displayName && requestedKeys.has(grant.displayName.trim().toLowerCase()))
+    keysOverlap(requestedKeys, appApprovalKeys(grant))
   );
 }
 
@@ -2001,12 +2096,24 @@ function findGrantForApp(app: AppInfo, context: ComputerUseContext): AppGrant | 
   const grants = grantStore(context);
   const direct = grants.get(grantKey(app));
   if (direct) return direct;
-  const bundle = app.bundleId?.trim().toLowerCase();
-  const display = app.displayName?.trim().toLowerCase();
+  const appKeys = appApprovalKeys(app);
   return [...grants.values()].find((grant) =>
-    Boolean(bundle && grant.bundleId?.trim().toLowerCase() === bundle)
-    || Boolean(display && grant.displayName?.trim().toLowerCase() === display)
+    keysOverlap(appKeys, appApprovalKeys(grant))
   );
+}
+
+function appApprovalKeys(app: AppInfo): Set<string> {
+  const keys = new Set<string>();
+  addApprovalKey(keys, app.bundleId);
+  addApprovalKey(keys, app.displayName);
+  return keys;
+}
+
+function keysOverlap(left: Set<string>, right: Set<string>): boolean {
+  for (const key of left) {
+    if (right.has(key)) return true;
+  }
+  return false;
 }
 
 function grantKey(app: AppInfo): string {
@@ -2259,6 +2366,40 @@ function parseAccessResultPayload(output: string): { granted?: AppGrant[] } | un
   return parseFirstJsonObject(output) as { granted?: AppGrant[] } | undefined;
 }
 
+async function recheckTccApprovalState(
+  input: ComputerUseInput,
+  context: ComputerUseContext
+): Promise<{ accessibility: boolean; screenRecording: boolean; message: string; next?: string } | undefined> {
+  if (!context.approvalResponse?.tccState) return undefined;
+  const current = await helper<Record<string, unknown>>("check_permissions", {}, context).catch(() => context.approvalResponse?.tccState);
+  return formatTccApprovalResult(input.action, current);
+}
+
+function formatTccApprovalResult(
+  action: ComputerUseAction,
+  state: Record<string, unknown> | undefined
+): { accessibility: boolean; screenRecording: boolean; message: string; next?: string } {
+  const accessibility = state?.accessibility === true;
+  const screenRecording = state?.screenRecording === true;
+  if (accessibility && screenRecording) {
+    return {
+      accessibility,
+      screenRecording,
+      message: "macOS Accessibility and Screen Recording are now both granted."
+    };
+  }
+  const missing = [
+    accessibility ? undefined : "Accessibility",
+    screenRecording ? undefined : "Screen Recording"
+  ].filter((item): item is string => Boolean(item));
+  return {
+    accessibility,
+    screenRecording,
+    message: `macOS ${missing.join(" and ")} permission(s) not yet granted. The permission panel has been shown; finish it in System Settings, restart Kira if macOS asks, then call ${action} again.`,
+    next: `call ${action} again`
+  };
+}
+
 function parseTeachStepResultPayload(output: string): { executed: number; results?: ComputerUseBatchActionResult[]; failed?: ComputerUseBatchActionResult; remaining?: number; exited?: boolean } | undefined {
   return parseFirstJsonObject(output) as { executed: number; results?: ComputerUseBatchActionResult[]; failed?: ComputerUseBatchActionResult; remaining?: number; exited?: boolean } | undefined;
 }
@@ -2346,6 +2487,7 @@ function formatScreenshot(result: ScreenshotResult, input: ComputerUseInput, cwd
     input.save_to_disk === true ? "Format: jpg" : undefined,
     `Image size sent to model: ${result.width}x${result.height}`,
     `Display ID: ${result.displayId ?? display?.displayId ?? display?.id ?? "unknown"}`,
+    result.backend ? `Capture backend: ${result.backend}` : undefined,
     result.monitorNote,
     "Click coordinates should be pixels from this screenshot image. Kira handles all display scaling."
   ].filter((line): line is string => Boolean(line));
@@ -2361,6 +2503,7 @@ function formatZoom(result: ZoomResult, input: ComputerUseInput, cwd: string): s
     filePath ? `Zoom saved: ${filePath}` : undefined,
     filePath ? "Format: jpg" : undefined,
     `Zoom image size sent to model: ${result.width}x${result.height}`,
+    result.backend ? `Capture backend: ${result.backend}` : undefined,
     `Source region in previous screenshot: (${input.x}, ${input.y}) ${input.width}x${input.height}`,
     "Click coordinates still refer to the full screenshot, not this zoomed image."
   ].filter((line): line is string => Boolean(line));
@@ -2488,6 +2631,10 @@ function validateComputerUseInput(input: ComputerUseInput): void {
   }
   if (input.action === "type" && input.text === undefined) {
     throw new ToolError("ComputerUse type action requires text", "bad-input");
+  }
+  if (input.action === "type" && (input.x !== undefined || input.y !== undefined)) {
+    requireCoordinate(input.x, "x");
+    requireCoordinate(input.y, "y");
   }
   if (input.action === "write_clipboard" && input.text === undefined) {
     throw new ToolError("ComputerUse write_clipboard action requires text", "bad-input");

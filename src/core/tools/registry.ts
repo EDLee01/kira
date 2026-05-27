@@ -196,6 +196,9 @@ export type ToolApprovalDecision = boolean | {
 export type ToolPermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "auto";
 export type ToolPermissionDecision = "allow" | "ask" | "deny";
 
+const TOOL_RESULT_MAX_CHARS = 120_000;
+const TOOL_RESULT_PREVIEW_CHARS = 8_000;
+
 export interface ToolPermissionRules {
   allow: string[];
   ask: string[];
@@ -417,6 +420,109 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizeToolUseForExecution(toolUse: MagiToolUsePart, tool: RegisteredTool): MagiToolUsePart {
+  const normalizedInput = normalizeToolInput(toolUse.name, tool.inputSchema, toolUse.input);
+  return normalizedInput === toolUse.input ? toolUse : { ...toolUse, input: normalizedInput };
+}
+
+function normalizeToolInput(
+  toolName: string,
+  inputSchema: Record<string, unknown>,
+  input: Record<string, unknown>
+): Record<string, unknown> {
+  let normalized = input;
+  const singleStringField = readSingleRequiredStringField(inputSchema);
+  if (singleStringField) {
+    const value = coerceSingleStringToolValue(toolName, singleStringField, input);
+    if (value !== undefined && input[singleStringField] !== value) {
+      normalized = { ...normalized, [singleStringField]: value };
+    }
+  }
+  if (toolName === "Bash") {
+    const command = coerceToolStringValue(input.command, BASH_COMMAND_INPUT_KEYS, { allowStringArray: true })
+      ?? coerceToolStringValue(input.raw, BASH_COMMAND_INPUT_KEYS, { allowStringArray: true })
+      ?? coerceToolStringValue(input.cmd, BASH_COMMAND_INPUT_KEYS, { allowStringArray: true })
+      ?? coerceToolStringValue(input.shell, BASH_COMMAND_INPUT_KEYS, { allowStringArray: true })
+      ?? coerceToolStringValue(input.script, BASH_COMMAND_INPUT_KEYS, { allowStringArray: true });
+    if (command !== undefined && normalized.command !== command) {
+      normalized = { ...normalized, command };
+    }
+  }
+  return normalized;
+}
+
+function readSingleRequiredStringField(inputSchema: Record<string, unknown>): string | undefined {
+  const required = Array.isArray(inputSchema.required)
+    ? inputSchema.required.filter((value): value is string => typeof value === "string")
+    : [];
+  if (required.length !== 1) {
+    return undefined;
+  }
+  const properties = isRecord(inputSchema.properties) ? inputSchema.properties : undefined;
+  const fieldSchema = properties?.[required[0]];
+  return isRecord(fieldSchema) && fieldSchema.type === "string" ? required[0] : undefined;
+}
+
+function coerceSingleStringToolValue(
+  toolName: string,
+  field: string,
+  input: Record<string, unknown>
+): string | undefined {
+  const keys = toolName === "Bash" ? BASH_COMMAND_INPUT_KEYS : [field, "value", "raw"];
+  return coerceToolStringValue(input[field], keys, { allowStringArray: toolName === "Bash" })
+    ?? coerceToolStringValue(input.raw, keys, { allowStringArray: toolName === "Bash" })
+    ?? coerceToolStringValue(input.value, keys, { allowStringArray: toolName === "Bash" });
+}
+
+const BASH_COMMAND_INPUT_KEYS = ["command", "cmd", "shell", "script", "bash", "code", "value", "raw"];
+
+function coerceToolStringValue(
+  value: unknown,
+  nestedKeys: readonly string[],
+  options: { allowStringArray?: boolean } = {},
+  depth = 0
+): string | undefined {
+  if (depth > 4) return undefined;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    const parsed = parseJsonLikeToolString(trimmed);
+    if (parsed !== undefined) {
+      const nested = coerceToolStringValue(parsed, nestedKeys, options, depth + 1);
+      if (nested !== undefined) return nested;
+    }
+    return trimmed;
+  }
+  if (isRecord(value)) {
+    for (const key of nestedKeys) {
+      const nested = coerceToolStringValue(value[key], nestedKeys, options, depth + 1);
+      if (nested !== undefined) return nested;
+    }
+    return undefined;
+  }
+  if (options.allowStringArray && Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    const parts = value.map((item) => item.trim()).filter(Boolean);
+    return parts.length > 0 ? parts.map(shellQuoteArgument).join(" ") : undefined;
+  }
+  return undefined;
+}
+
+function parseJsonLikeToolString(value: string): unknown {
+  if (!/^[{\[]/.test(value)) return undefined;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function shellQuoteArgument(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) {
+    return value;
+  }
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 export async function executeRegisteredTool(input: {
   cwd: string;
   toolUse: MagiToolUsePart;
@@ -451,6 +557,7 @@ export async function executeRegisteredTool(input: {
   if (!tool) {
     return errorResult(input.toolUse, `Unknown tool: ${input.toolUse.name}`);
   }
+  const toolUse = normalizeToolUseForExecution(input.toolUse, tool);
   try {
     const context: ToolExecutionContext = {
       cwd: input.cwd,
@@ -467,7 +574,7 @@ export async function executeRegisteredTool(input: {
       promptModel: input.promptModel,
       userQuestionResolver: input.userQuestionResolver,
       userMessageSink: input.userMessageSink,
-      toolUse: input.toolUse,
+      toolUse,
       spawnSubAgent: input.spawnSubAgent,
       signal: input.signal,
       computerUseTeachStepResolver: input.computerUseTeachStepResolver,
@@ -477,7 +584,7 @@ export async function executeRegisteredTool(input: {
       computerUseDeniedBundleIds: input.computerUseDeniedBundleIds
     };
     const permission = checkToolPermission({
-      toolUse: input.toolUse,
+      toolUse,
       cwd: input.cwd,
       mode: context.permissionMode,
       rules: context.rules,
@@ -488,18 +595,18 @@ export async function executeRegisteredTool(input: {
       sessionId: context.sessionId
     });
     // Generate diff preview for FileWrite/FileEdit when approval is needed
-    if (permission.decision === "ask" && (input.toolUse.name === "FileWrite" || input.toolUse.name === "FileEdit")) {
+    if (permission.decision === "ask" && (toolUse.name === "FileWrite" || toolUse.name === "FileEdit")) {
       try {
-        const filePath = readString(input.toolUse.input, "file_path");
+        const filePath = readString(toolUse.input, "file_path");
         const resolved = resolveWorkspacePath(input.cwd, filePath);
         const before = existsSync(resolved.absolutePath) ? readFileSync(resolved.absolutePath, "utf8") : "";
         let after: string;
-        if (input.toolUse.name === "FileWrite") {
-          after = readString(input.toolUse.input, "content");
+        if (toolUse.name === "FileWrite") {
+          after = readString(toolUse.input, "content");
         } else {
-          const oldString = readString(input.toolUse.input, "old_string");
-          const newString = readString(input.toolUse.input, "new_string");
-          const replaceAll = Boolean(input.toolUse.input.replace_all);
+          const oldString = readString(toolUse.input, "old_string");
+          const newString = readString(toolUse.input, "new_string");
+          const replaceAll = Boolean(toolUse.input.replace_all);
           after = replaceAll ? before.split(oldString).join(newString) : before.replace(oldString, newString);
         }
         permission.diff = createUnifiedDiff(resolved.relativePath, before, after);
@@ -509,33 +616,33 @@ export async function executeRegisteredTool(input: {
     }
     const approvalPermission = permission.decision === "ask" ? permission : undefined;
     if (permission.decision === "ask") {
-      const approval = await input.approvalResolver?.({ toolUse: input.toolUse, permission });
+      const approval = await input.approvalResolver?.({ toolUse, permission });
       const approved = typeof approval === "boolean" ? approval : approval?.approved;
       if (approval && typeof approval !== "boolean") {
         context.computerUseApprovalResponse = approval.computerUse;
       }
       if (!approved) {
-        return errorResult(input.toolUse, `Permission ask: ${permission.reason}`, permission);
+        return errorResult(toolUse, `Permission ask: ${permission.reason}`, permission);
       }
     } else if (permission.decision !== "allow") {
-      return errorResult(input.toolUse, `Permission ${permission.decision}: ${permission.reason}`);
+      return errorResult(toolUse, `Permission ${permission.decision}: ${permission.reason}`);
     }
     throwIfAborted(input.signal);
-    const raw = await tool.call(input.toolUse.input, context);
+    const raw = await tool.call(toolUse.input, context);
     throwIfAborted(input.signal);
     return {
-      toolCallId: input.toolUse.id,
-      toolName: input.toolUse.name,
+      toolCallId: toolUse.id,
+      toolName: toolUse.name,
       content: formatToolResult({
         content: raw,
         outputRoot: context.outputRoot,
-        maxChars: 30_000,
-        previewChars: 2_000
+        maxChars: TOOL_RESULT_MAX_CHARS,
+        previewChars: TOOL_RESULT_PREVIEW_CHARS
       }),
       permission: approvalPermission
     };
   } catch (error) {
-    return errorResult(input.toolUse, error instanceof Error ? error.message : String(error));
+    return errorResult(toolUse, error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -572,10 +679,11 @@ export async function executeRegisteredTools(input: {
 
   input.toolUses.forEach((toolUse, index) => {
     const tool = registry.get(toolUse.name);
-    if (tool?.isConcurrencySafe(toolUse.input)) {
-      concurrent.push({ index, toolUse });
+    const normalizedToolUse = tool ? normalizeToolUseForExecution(toolUse, tool) : toolUse;
+    if (tool?.isConcurrencySafe(normalizedToolUse.input)) {
+      concurrent.push({ index, toolUse: normalizedToolUse });
     } else {
-      sequential.push({ index, toolUse });
+      sequential.push({ index, toolUse: normalizedToolUse });
     }
   });
 
@@ -652,17 +760,17 @@ export function formatToolResult(input: {
   if (input.content.includes("<<MAGI_IMAGE:")) {
     return input.content;
   }
-  const maxChars = input.maxChars ?? 30_000;
+  const maxChars = input.maxChars ?? TOOL_RESULT_MAX_CHARS;
   if (input.content.length <= maxChars) {
     return input.content;
   }
   if (!input.outputRoot) {
-    return `${input.content.slice(0, input.previewChars ?? 2_000)}\n...[truncated]...`;
+    return `${input.content.slice(0, input.previewChars ?? TOOL_RESULT_PREVIEW_CHARS)}\n...[truncated]...`;
   }
   mkdirSync(input.outputRoot, { recursive: true });
   const file = path.join(input.outputRoot, `${randomUUID()}.txt`);
   writeFileSync(file, input.content, "utf8");
-  return `${input.content.slice(0, input.previewChars ?? 2_000)}\n...[truncated]...\n\nFull output saved to: ${file}`;
+  return `${input.content.slice(0, input.previewChars ?? TOOL_RESULT_PREVIEW_CHARS)}\n...[truncated]...\n\nFull output saved to: ${file}`;
 }
 
 type ComputerUseToolAction =
@@ -749,7 +857,7 @@ const computerUseBatchActionSchema = {
     },
     coordinate: {
       ...coordinateTupleSchema,
-      description: "(x, y) for click/mouse_move/scroll/left_click_drag end point."
+      description: "(x, y) for click/mouse_move/scroll/type focus/left_click_drag end point."
     },
     start_coordinate: {
       ...coordinateTupleSchema,
@@ -818,7 +926,10 @@ function checkComputerUseToolPermission(
     return undefined;
   }
   if (input.action === "request_access") {
-    return { decision: "allow", reason: "ComputerUse access is managed by Mac Permissions setup and session app policy" };
+    if (isIdempotentComputerUseAccessRequest(input, context)) {
+      return { decision: "allow", reason: "ComputerUse access and requested grant flags are already allowed for this session" };
+    }
+    return { decision: "ask", reason: "ComputerUse is requesting access to selected desktop apps and any requested grant flags" };
   }
   if (input.action === "request_teach_access") {
     return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };
@@ -845,7 +956,7 @@ const COMPUTER_USE_COMPAT_TOOLS: RegisteredTool[] = [
   computerUseCompatTool({
     name: "screenshot",
     action: "screenshot",
-    description: "Take a screenshot of the primary display. Applications not in the session allowlist are excluded at the compositor level — only granted apps and the desktop are visible. Returns an error if the allowlist is empty. The returned image is what subsequent click coordinates are relative to.",
+    description: "Take a screenshot of the primary display. Applications not in the session allowlist are excluded where the platform supports filtering — only granted apps and the desktop should be treated as reliable visible context. Returns an error if the allowlist is empty. The returned image is what subsequent click coordinates are relative to.",
     inputSchema: computerUseSchema({
       save_to_disk: { type: "boolean", description: "Save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image — screenshots you're just looking at don't need saving." }
     }),
@@ -896,8 +1007,11 @@ const COMPUTER_USE_COMPAT_TOOLS: RegisteredTool[] = [
   computerUseCompatTool({
     name: "type",
     action: "type",
-    description: "Type text into whatever currently has keyboard focus. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. Newlines are supported. For keyboard shortcuts use `key` instead.",
-    inputSchema: computerUseSchema({ text: { type: "string", description: "Text to type." } }, ["text"])
+    description: "Type text into the current keyboard focus, or click `coordinate` first to focus a target field and then type. The frontmost or coordinate target application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. Newlines are supported. On macOS, use request_access with clipboardWrite for reliable normal text entry, especially in WeChat. For keyboard shortcuts use `key` instead.",
+    inputSchema: computerUseSchema({
+      text: { type: "string", description: "Text to type." },
+      coordinate: { ...coordinateTupleSchema, description: "Optional (x, y) target field to click immediately before typing." }
+    }, ["text"])
   }),
   computerUseCompatTool({
     name: "key",
@@ -1007,7 +1121,7 @@ const COMPUTER_USE_COMPAT_TOOLS: RegisteredTool[] = [
   computerUseCompatTool({
     name: "computer_batch",
     action: "batch",
-    description: "Execute a sequence of actions in ONE tool call. Each individual tool call requires a model→API round trip (seconds); batching a predictable sequence eliminates all but one. Use this whenever you can predict the outcome of several actions ahead — e.g. click a field, type into it, press Return. Actions execute sequentially and stop on the first error. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. The frontmost check runs before EACH action inside the batch — if an action opens a non-allowed app, the next action's gate fires and the batch stops there. Mid-batch screenshot actions are allowed for inspection but coordinates in subsequent clicks always refer to the PRE-BATCH full-screen screenshot.",
+    description: "Execute a sequence of actions in ONE tool call. Each individual tool call requires a model→API round trip (seconds); batching a predictable sequence eliminates all but one. Use this whenever you can predict the outcome of several actions ahead — e.g. click a field, type into it, press Return. Actions execute sequentially and stop on the first error. The frontmost application must be in the session allowlist at the time of this call, or this tool returns an error and does nothing. The frontmost check runs before EACH action inside the batch — if an action opens a non-allowed app, the next action's gate fires and the batch stops there. Mid-batch screenshot actions are allowed for inspection but coordinates in subsequent clicks always refer to the PRE-BATCH full-screen screenshot. On Windows, controlling batches return a post-action screenshot by default; inspect it before claiming user-visible work is complete.",
     inputSchema: computerUseSchema({
       actions: {
         type: "array",
@@ -2200,7 +2314,7 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
   },
   {
     name: "ComputerUse",
-    description: "Observe and control the visible desktop. Actions: screenshot, zoom, display_info, switch_display, permissions, cursor_position, frontmost_app, app_under_point, request_access, request_teach_access, list_granted_apps, list_running_apps, list_installed_apps, open_app, click, double_click, triple_click, right_click, middle_click, move, drag, left_mouse_down, left_mouse_up, scroll, type, key, hold_key, hotkey, read_clipboard, write_clipboard, wait, batch, teach_step, teach_batch. macOS Screen Recording and Accessibility are first-run setup items in Kira Settings; do not repeatedly ask for OS permissions during a task if the user says they are granted. Call request_access only for apps not already in list_granted_apps, or to add missing grant flags. Use request_teach_access plus teach_step/teach_batch when the user wants to learn or be guided. Use display_info and switch_display for multi-monitor work. Use screenshot first to inspect the screen, then zoom to inspect small text. Use left_mouse_down/up for held-button interactions after moving the pointer. Batch coordinates refer to the same pre-batch screenshot.",
+    description: "Observe and control the visible desktop. Do not use ComputerUse for work that can be done headlessly with file tools or shell/script tools, such as creating a new PowerPoint, Word, Excel, PDF, report, archive, image, or code file. Use ComputerUse when the user explicitly wants the current visible app/window manipulated or the task requires visual-only context. Actions: screenshot, zoom, display_info, switch_display, permissions, cursor_position, frontmost_app, app_under_point, request_access, request_teach_access, list_granted_apps, list_running_apps, list_installed_apps, open_app, click, double_click, triple_click, right_click, middle_click, move, drag, left_mouse_down, left_mouse_up, scroll, type, key, hold_key, hotkey, read_clipboard, write_clipboard, wait, batch, teach_step, teach_batch. macOS Screen Recording and Accessibility are first-run setup items in Kira Settings; do not repeatedly ask for OS permissions during a task if the user says they are granted. Call request_access only for apps not already in list_granted_apps, or to add missing grant flags. Use request_teach_access plus teach_step/teach_batch when the user wants to learn or be guided. Use display_info and switch_display for multi-monitor work. Use screenshot first to inspect the screen, then zoom to inspect small text. Use left_mouse_down/up for held-button interactions after moving the pointer. Batch coordinates refer to the same pre-batch screenshot. On Windows, controlling actions return a post-action screenshot by default; inspect it or another concrete result before claiming visible work is complete.",
     category: "system",
     tags: ["computer-use", "desktop", "screen", "mouse", "keyboard", "macos", "windows"],
     inputSchema: ComputerUseInputSchema,
@@ -2229,7 +2343,10 @@ const BUILTIN_TOOLS: RegisteredTool[] = [
         return undefined;
       }
       if (input.action === "request_access") {
-        return { decision: "allow", reason: "ComputerUse access is managed by Mac Permissions setup and session app policy" };
+        if (isIdempotentComputerUseAccessRequest(input, context)) {
+          return { decision: "allow", reason: "ComputerUse access and requested grant flags are already allowed for this session" };
+        }
+        return { decision: "ask", reason: "ComputerUse is requesting access to selected desktop apps and any requested grant flags" };
       }
       if (input.action === "request_teach_access") {
         return { decision: "ask", reason: "ComputerUse is requesting permission to guide the user through selected desktop apps" };

@@ -124,7 +124,7 @@ export function modelDiscoveryFromSettings(settings: ModelSettings): ModelDiscov
     ok: true,
     message: parsedModels.length > 0 ? "Loaded saved model list" : fallback.message,
     models,
-    auto: parseSavedAutoRoutes(settings.autoRoutes, models) ?? buildAutoRoutes(models),
+    auto: buildAutoRoutes(models),
     updatedAt: settings.modelsUpdatedAt || fallback.updatedAt,
   };
 }
@@ -268,36 +268,18 @@ function buildModelDiscoveryResult(input: {
 }
 
 function buildAutoRoutes(models: DiscoveredModel[]): AutoModelRoutes {
-  const byRole = (role: ModelCapabilities["role"]) => models.find((m) => m.capabilities.role === role)?.id;
-  const fast = byRole("fast") ?? models[0]?.id ?? "claude-haiku-4-5";
-  const main = byRole("main") ?? fast;
-  const deep = byRole("deep") ?? main;
-  const vision = [main, deep, fast, ...models.map((m) => m.id)].find((id) => models.find((m) => m.id === id)?.capabilities.vision) ?? main;
-  const long = [main, deep, fast, ...models.map((m) => m.id)].find((id) => models.find((m) => m.id === id)?.capabilities.longContext) ?? main;
+  const bestByRole = (role: ModelCapabilities["role"]) => bestModel(models.filter((m) => m.capabilities.role === role))?.id;
+  const bestAny = bestModel(models)?.id ?? "claude-haiku-4-5";
+  const fast = bestByRole("fast") ?? bestAny;
+  const main = bestByRole("main") ?? bestAny;
+  const deep = bestByRole("deep") ?? main;
+  const vision = bestModel(models.filter((model) => model.capabilities.vision))?.id ?? main;
+  const long = bestModel(models.filter((model) => model.capabilities.longContext))?.id ?? main;
   return { fast, main, deep, vision, long };
 }
 
-function parseSavedAutoRoutes(raw: string | undefined, models: DiscoveredModel[]): AutoModelRoutes | null {
-  if (!raw) return null;
-  try {
-    const value = JSON.parse(raw);
-    if (!value || typeof value !== "object") return null;
-    const allowed = new Set(models.map((m) => m.id));
-    const fallback = buildAutoRoutes(models);
-    return {
-      fast: readRoute(value.fast, allowed, fallback.fast),
-      main: readRoute(value.main, allowed, fallback.main),
-      deep: readRoute(value.deep, allowed, fallback.deep),
-      vision: readRoute(value.vision, allowed, fallback.vision),
-      long: readRoute(value.long, allowed, fallback.long),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function readRoute(value: unknown, allowed: Set<string>, fallback: string): string {
-  return typeof value === "string" && allowed.has(value) ? value : fallback;
+function bestModel(models: DiscoveredModel[]): DiscoveredModel | undefined {
+  return [...models].sort((a, b) => modelQualityScore(b.id) - modelQualityScore(a.id) || a.id.localeCompare(b.id))[0];
 }
 
 function parseJsonArray(raw: string | undefined): string[] {
@@ -322,7 +304,7 @@ function toDiscoveredModel(id: string, source: "discovered" | "fallback"): Disco
 function inferCapabilities(modelId: string): ModelCapabilities {
   const id = modelId.toLowerCase();
   const role: ModelCapabilities["role"] =
-    id.includes("opus") || id.includes("o3") || id.includes("o4") || id.includes("o1") || id.includes("reasoner") || id.includes("reasoning")
+    id.includes("opus") || id.includes("o3") || id.includes("o4") || id.includes("o1") || id.includes("reasoner") || id.includes("reasoning") || (id.startsWith("gpt-") && id.includes("pro"))
       ? "deep"
       : id.includes("haiku") || id.includes("mini") || id.includes("flash") || id.includes("lite") || id.includes("small")
         ? "fast"
@@ -388,15 +370,51 @@ function normalizeModelIds(ids: string[]): string[] {
 }
 
 function compareModels(a: string, b: string): number {
-  const score = (id: string): number => {
-    const lower = id.toLowerCase();
-    if (lower.includes("auto")) return 0;
-    if (lower.includes("haiku") || lower.includes("flash") || lower.includes("mini")) return 10;
-    if (lower.includes("sonnet") || lower.includes("pro") || lower.includes("gpt-4.1")) return 20;
-    if (lower.includes("opus") || lower.includes("reason")) return 30;
-    return 40;
-  };
-  return score(a) - score(b) || a.localeCompare(b);
+  return modelQualityScore(b) - modelQualityScore(a) || a.localeCompare(b);
+}
+
+function modelQualityScore(id: string): number {
+  const lower = id.toLowerCase();
+  if (lower.includes("auto")) return 0;
+
+  let score = 100;
+  const gpt = lower.match(/^gpt-(\d+)(?:\.(\d+))?/);
+  if (gpt) {
+    score = 1000 + Number(gpt[1]) * 100 + Number(gpt[2] ?? 0) * 10;
+  } else if (lower.includes("o4")) {
+    score = 1480;
+  } else if (lower.includes("o3")) {
+    score = 1430;
+  } else if (lower.includes("o1")) {
+    score = 1410;
+  } else if (lower.includes("claude-opus-4-7")) {
+    score = 1670;
+  } else if (lower.includes("claude-opus-4")) {
+    score = 1640;
+  } else if (lower.includes("claude-sonnet-4-6")) {
+    score = 1560;
+  } else if (lower.includes("claude-sonnet-4")) {
+    score = 1540;
+  } else if (lower.includes("claude-haiku-4-5")) {
+    score = 1450;
+  } else if (lower.includes("gemini-2.5")) {
+    score = 1250;
+  } else if (lower.includes("gemini-2")) {
+    score = 1200;
+  } else if (lower.includes("deepseek-reasoner")) {
+    score = 1320;
+  } else if (lower.includes("deepseek")) {
+    score = 1180;
+  }
+
+  if (lower.includes("pro")) score += 8;
+  if (lower.includes("codex")) score += 5;
+  if (lower.includes("chat")) score -= 4;
+  if (lower.includes("nano")) score -= 35;
+  if (lower.includes("mini")) score -= 25;
+  if (lower.includes("flash") || lower.includes("haiku") || lower.includes("lite") || lower.includes("small")) score -= 20;
+  if (lower.includes("preview")) score -= 5;
+  return score;
 }
 
 function labelForModel(id: string): string {

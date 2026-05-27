@@ -207,7 +207,7 @@ async function main(): Promise<void> {
   assert.match(computerUse, /input\.save_to_disk === true/);
   assert.match(computerUse, /saveImageFile/);
   assert.match(computerUse, /write_clipboard/);
-  assert.match(computerUse, /paste_text/);
+  assert.match(computerUse, /pasteTextViaClipboard/);
   assert.match(computerUse, /const MOVE_SETTLE_MS = 50/);
   assert.match(computerUse, /const COMPUTER_USE_BATCH_ACTIONS = \[/);
   assert.match(computerUse, /const NORMALIZED_COMPUTER_USE_BATCH_ACTIONS = new Set<ComputerUseBatchAction>/);
@@ -227,9 +227,11 @@ async function main(): Promise<void> {
   assert.match(computerUse, /await helper\("drag"[\s\S]{0,360}await wait\(MOVE_SETTLE_MS\)/);
   assert.match(computerUse, /Post-action screenshot/);
   assert.match(computerUse, /includePostActionScreenshot/);
-  assert.match(computerUse, /includePostActionScreenshot !== true/);
+  assert.match(computerUse, /function shouldIncludePostActionScreenshot/);
+  assert.match(computerUse, /os\.platform\(\) === "win32" && shouldAutoVerifyWindowsAction/);
+  assert.match(computerUse, /function shouldAutoVerifyWindowsAction/);
   assert.match(computerUse, /Teach steps return their own final screenshot when actions run/);
-  assert.match(computerUse, /return formatJson\(\{ completed \}\);/);
+  assert.match(computerUse, /return withOptionalPostActionScreenshot\(formatJson\(\{ completed \}\), input, context\);/);
   assert.match(computerUse, /function withPostActionScreenshot/);
   assert.match(computerUse, /includeFinalScreenshot\?: boolean/);
   assert.match(computerUse, /includeFinalScreenshot: false/);
@@ -332,8 +334,14 @@ async function main(): Promise<void> {
   assert.match(computerUse, /systemKeyCombos/);
   assert.match(computerUse, /force clipboard paste when true/);
   assert.match(computerUse, /input\.viaClipboard === true/);
+  assert.match(computerUse, /const typePoint = input\.x === undefined && input\.y === undefined/);
+  assert.match(computerUse, /await helper\("click", \{\n          x: typePoint\.x,/);
   assert.match(computerUse, /shouldUseClipboardForTyping\(input\.text \?\? "", context\)/);
-  assert.match(computerUse, /await helper\("paste_text", \{ text: input\.text \?\? "" \}, context\)/);
+  assert.match(computerUse, /await pasteTextViaClipboard\(input\.text \?\? "", context\)/);
+  assert.match(computerUse, /async function pasteTextViaClipboard/);
+  assert.match(computerUse, /await helper\("write_clipboard", \{ text \}, context\)/);
+  assert.match(computerUse, /keySequence: os\.platform\(\) === "darwin" \? "command\+v" : "ctrl\+v"/);
+  assert.match(computerUse, /missingClipboardWriteMessage/);
   assert.doesNotMatch(computerUse, /await helper\("write_clipboard", \{ text: input\.text \?\? "" \}, context\);\n        await helper\("paste_clipboard", \{\}, context\)/);
   assert.match(computerUse, /text\.includes\("\\n"\)/);
   assert.match(computerUse, /os\.platform\(\) === "darwin"/);
@@ -363,6 +371,8 @@ async function main(): Promise<void> {
   assert.match(registryCompat, /computerUseCompatTool/);
   assert.match(registryCompat, /callComputerUseAction/);
   assert.match(registryCompat, /checkComputerUseToolPermission/);
+  assert.match(registryCompat, /isIdempotentComputerUseAccessRequest/);
+  assert.match(registryCompat, /requested grant flags are already allowed/);
   assert.match(registryCompat, /name: "screenshot"/);
   assert.match(registryCompat, /name: "left_click"/);
   assert.match(registryCompat, /name: "mouse_move"/);
@@ -389,6 +399,8 @@ async function main(): Promise<void> {
   assert.match(registryCompat, /"list_installed_applications"/);
   assert.match(registryCompat, /\.filter\(\(tool\) => !MODEL_HIDDEN_BUILTIN_TOOLS\.has\(tool\.name\)\)/);
   assert.match(registryCompat, /name: "ComputerUse"/);
+  assert.match(registryCompat, /Do not use ComputerUse for work that can be done headlessly/);
+  assert.match(registryCompat, /creating a new PowerPoint, Word, Excel, PDF/);
   assert.match(registryCompat, /name: "Browser"/);
   assert.match(registryCompat, /name: "open_application"[\s\S]*\}, \["app"\]\)/);
   assert.match(registryCompat, /name: "switch_display"[\s\S]*\}, \["display"\]\)/);
@@ -446,7 +458,7 @@ async function main(): Promise<void> {
     { name: "triple_click", required: ["coordinate"], props: ["coordinate", "text"] },
     { name: "right_click", required: ["coordinate"], props: ["coordinate", "text"] },
     { name: "middle_click", required: ["coordinate"], props: ["coordinate", "text"] },
-    { name: "type", required: ["text"], props: ["text"] },
+    { name: "type", required: ["text"], props: ["text", "coordinate"] },
     { name: "key", required: ["text"], props: ["text", "repeat"] },
     { name: "scroll", required: ["coordinate", "scroll_direction", "scroll_amount"], props: ["coordinate", "scroll_direction", "scroll_amount"] },
     { name: "left_click_drag", required: ["coordinate"], props: ["coordinate", "start_coordinate"] },
@@ -544,23 +556,23 @@ async function main(): Promise<void> {
   );
   assert.equal(
     getDefaultComputerUseTier({ bundleId: "com.apple.Safari", displayName: "Safari" }),
-    "read"
+    "full"
   );
   assert.equal(
     evaluateComputerUseAppPolicy({ bundleId: "com.apple.Safari", displayName: "Safari" }, "mouse").allowed,
-    false
+    true
   );
   assert.equal(
     evaluateComputerUseAppPolicy({ bundleId: "com.apple.Safari", displayName: "Safari" }, "open_app").allowed,
     true
   );
   assert.match(
-    evaluateComputerUseAppPolicy({ bundleId: "com.apple.Safari", displayName: "Safari" }, "mouse").reason ?? "",
-    /tier "read"/
+    evaluateComputerUseAppPolicy({ bundleId: "com.apple.Safari", displayName: "Safari" }, "mouse").warning ?? "",
+    /visible page only/
   );
   assert.match(
     buildComputerUseTierGuidance([{ bundleId: "com.apple.Safari", displayName: "Safari", tier: "read" }]) ?? "",
-    /visible in screenshots only/
+    /observe only/
   );
   assert.match(
     buildComputerUseTierGuidance([{ bundleId: "com.apple.Terminal", displayName: "Terminal", tier: "click" }]) ?? "",
@@ -601,8 +613,8 @@ async function main(): Promise<void> {
   assert.match(engine, /computerUsePreview/);
   assert.match(engine, /request_access/);
   assert.match(engine, /request_teach_access/);
-  assert.match(engine, /Accessibility:\\s\*granted/);
-  assert.match(engine, /Screen Recording:\\s\*granted/);
+  assert.match(engine, /Accessibility: \*granted\*/);
+  assert.match(engine, /Screen Recording: \*granted\*/);
   assert.match(engine, /Allow Kira to guide you\?/);
   assert.match(engine, /teaching overlay will appear/);
   assert.match(engine, /Each step waits for your Next or Exit choice/);
@@ -665,11 +677,19 @@ async function main(): Promise<void> {
   assert.match(systemPrompt, /request_teach_access/);
   assert.match(systemPrompt, /teach_step/);
   assert.match(systemPrompt, /teach_batch/);
-  assert.match(systemPrompt, /terminal\/IDE\/script-runner apps/);
+  assert.match(systemPrompt, /Prefer headless\/file-based work over ComputerUse/);
+  assert.match(systemPrompt, /PowerPoint, Word, Excel, PDFs/);
+  assert.match(systemPrompt, /create the real file with file tools or shell\/script tools first/);
+  assert.match(systemPrompt, /Use ComputerUse only when the user explicitly wants the current visible app\/window manipulated/);
+  assert.match(systemPrompt, /educational, coursework, report, slide-deck, Office-file/);
+  assert.match(systemPrompt, /explicit cheating, impersonation, covert submission/);
+  assert.match(systemPrompt, /do your own homework/);
+  assert.match(systemPrompt, /Report outcomes faithfully/);
+  assert.match(systemPrompt, /Terminal\/IDE\/script-runner apps/);
   assert.match(systemPrompt, /switch_display/);
   assert.doesNotMatch(systemPrompt, /call display_info/);
   assert.match(systemPrompt, /left_mouse_down/);
-  assert.match(systemPrompt, /held mouse\/key actions/);
+  assert.match(systemPrompt, /always pair it with left_mouse_up/);
 
   const lock = read("src/core/tools/computer-use-lock.ts");
   assert.match(lock, /computer-use\.lock/);
@@ -680,7 +700,13 @@ async function main(): Promise<void> {
   assert.match(lock, /process\.kill\(pid, 0\)/);
 
   const runtimeBridge = read("src/core/tools/computer-use-runtime.ts");
+  const macBridge = read("src/core/tools/mac-computer-use-bridge.ts");
   assert.match(runtimeBridge, /runtimesRoot, "computer-use"/);
+  assert.match(runtimeBridge, /callMacComputerUseBridge/);
+  assert.match(runtimeBridge, /isMacComputerUseBridgeAvailable/);
+  assert.match(runtimeBridge, /command === "screenshot"/);
+  assert.match(runtimeBridge, /command === "zoom"/);
+  assert.match(runtimeBridge, /command === "validate_click_target"/);
   assert.match(runtimeBridge, /requirements-win\.txt/);
   assert.match(runtimeBridge, /mac_helper\.py/);
   assert.match(runtimeBridge, /win_helper\.py/);
@@ -689,6 +715,33 @@ async function main(): Promise<void> {
   assert.match(runtimeBridge, /PIP_INDEX_URL/);
   assert.match(runtimeBridge, /FALLBACK_PIP_INDEX_URL/);
   assert.match(runtimeBridge, /runPipInstall/);
+  assert.match(macBridge, /import\("electron"\)/);
+  assert.match(macBridge, /desktopCapturer/);
+  assert.match(macBridge, /process\.versions\.electron/);
+  assert.match(macBridge, /electron\.clipboard\.readText/);
+  assert.match(macBridge, /electron\.clipboard\.writeText/);
+  assert.match(macBridge, /systemPreferences\.getMediaAccessStatus\("screen"\)/);
+  assert.match(macBridge, /systemPreferences\.isTrustedAccessibilityClient\(false\)/);
+  assert.match(macBridge, /case "screenshot"/);
+  assert.match(macBridge, /case "zoom"/);
+  assert.match(macBridge, /case "validate_click_target"/);
+  assert.match(macBridge, /formatDesktopCaptureError/);
+  assert.match(macBridge, /Failed to get sources/);
+  assert.match(macBridge, /case "key"/);
+  assert.match(macBridge, /case "click"/);
+  assert.match(macBridge, /case "type"/);
+  assert.match(macBridge, /loadNativeInputModule/);
+  assert.match(macBridge, /kira_mac_computer_use\.node/);
+  assert.match(macBridge, /nativeImage\.createFromBuffer/);
+  const macNativeSource = read("native/mac-computer-use/src/mac_computer_use.mm");
+  assert.match(macNativeSource, /CGEventCreateKeyboardEvent/);
+  assert.match(macNativeSource, /CGEventCreateMouseEvent/);
+  assert.match(macNativeSource, /AXIsProcessTrusted/);
+  const packageJson = read("package.json");
+  assert.match(packageJson, /build:mac-native/);
+  const nativeBuildScript = read("scripts/build-mac-computer-use-native.cjs");
+  assert.match(nativeBuildScript, /node-gyp/);
+  assert.match(nativeBuildScript, /process\.platform !== "darwin"/);
 
   const registry = read("src/core/tools/registry.ts");
   assert.match(registry, /sessionId: context\.sessionId/);
@@ -726,7 +779,8 @@ async function main(): Promise<void> {
   assert.match(macHelper, /def paste_clipboard/);
   assert.match(macHelper, /def paste_text/);
   assert.match(macHelper, /original = read_clipboard\(\)/);
-  assert.match(macHelper, /write_clipboard\(text\)\n        time\.sleep\(0\.04\)\n        paste_clipboard\(\)\n        time\.sleep\(0\.18\)/);
+  assert.match(macHelper, /pyautogui\.hotkey\("command", "v", interval=0\.02\)/);
+  assert.match(macHelper, /write_clipboard\(text\)\n        time\.sleep\(0\.08\)\n        paste_clipboard\(\)\n        time\.sleep\(0\.35\)/);
   assert.match(macHelper, /def preview_hide_set/);
   assert.match(macHelper, /def prepare_for_action/);
   assert.match(macHelper, /def restore_apps/);
@@ -757,6 +811,8 @@ async function main(): Promise<void> {
 
   const builder = read("electron-builder.yml");
   assert.match(builder, /from: runtime/);
+  assert.match(builder, /from: dist\/native/);
+  assert.match(builder, /to: native/);
 
   assert.match(computerUse, /could not prepare the Computer Use runtime/);
   assert.match(computerUse, /dependency install\|pip/);
@@ -869,11 +925,7 @@ async function main(): Promise<void> {
         userConsented: true
       }
     });
-    assert.equal(getComputerUseSessionState(legacyGrantContext).grants[0]?.tier, "read");
-    await assert.rejects(
-      executeComputerUse(parseComputerUseInput({ action: "click", x: 1, y: 1, app: "Safari" }), legacyGrantContext),
-      /visible browser page.*cannot click, type, scroll, navigate, drag, or send shortcuts/
-    );
+    assert.equal(getComputerUseSessionState(legacyGrantContext).grants[0]?.tier, "full");
     await assert.rejects(
       executeComputerUse(parseComputerUseInput({ action: "open_app", app: "Saf" }), legacyGrantContext),
       /not granted|request_access|could not identify/i
@@ -891,13 +943,13 @@ async function main(): Promise<void> {
     }), {
       ...localizedSafariGrantContext,
       approvalResponse: {
-        granted: [{ bundleId: "com.apple.Safari", displayName: "Safari浏览器", grantedAt: new Date().toISOString() }],
+        granted: [{ bundleId: "com.apple.Safari", displayName: "Safari浏览器", tier: "read", grantedAt: new Date().toISOString() }],
         userConsented: true
       }
     });
     await assert.rejects(
       executeComputerUse(parseComputerUseInput({ action: "click", x: 1, y: 1, app: "Safari" }), localizedSafariGrantContext),
-      /visible browser page.*cannot click, type, scroll, navigate, drag, or send shortcuts/
+      /read tier only|observe this app only/
     );
     await assert.rejects(
       executeComputerUse(parseComputerUseInput({ action: "open_app", app: "Saf" }), localizedSafariGrantContext),
@@ -1034,7 +1086,7 @@ async function main(): Promise<void> {
     assert.equal(accessPayload.granted.find((grant) => grant.bundleId === "com.apple.Terminal")?.tier, "click");
     assert.equal(accessPayload.grantFlags.clipboardRead, false);
     assert.deepEqual(accessPayload.denied, [{ bundleId: "Spotify", reason: "user_denied" }]);
-    assert.match(accessPayload.tierGuidance ?? "", /visible in screenshots only/);
+    assert.match(accessPayload.tierGuidance ?? "", /observe only/);
     assert.match(accessPayload.tierGuidance ?? "", /Use Bash for command-line work/);
 	    assert.match(accessPayload.policyDenied?.guidance ?? "", /blocked by Computer Use policy/);
 	    assert.equal(accessPayload.screenshotFiltering, "native");
@@ -1067,7 +1119,7 @@ async function main(): Promise<void> {
     assert.equal(teachAccessPayload.teachModeActive, true);
     assert.equal(teachAccessPayload.granted.find((grant) => grant.bundleId === "com.apple.Safari")?.tier, "read");
     assert.equal(teachAccessPayload.granted.find((grant) => grant.bundleId === "com.apple.Terminal")?.tier, "click");
-	    assert.match(teachAccessPayload.tierGuidance ?? "", /visible in screenshots only/);
+	    assert.match(teachAccessPayload.tierGuidance ?? "", /observe only/);
 	    assert.equal(teachAccessPayload.screenshotFiltering, "native");
 	    assert.equal(teachAccessPayload.next, undefined);
     await releaseComputerUseSession({ cwd: project, kiraWorkspaceRoot: workspace, sessionId: "structured-teach-feedback-session" });
@@ -1136,7 +1188,7 @@ async function main(): Promise<void> {
       }
     });
     assert.equal(repeatedAccessPermission.decision, "allow");
-    assert.match(repeatedAccessPermission.reason, /already granted/);
+    assert.match(repeatedAccessPermission.reason, /already allowed/);
     const partialRepeatedAccessPermission = checkToolPermission({
       cwd: project,
       kiraWorkspaceRoot: workspace,
@@ -1416,6 +1468,9 @@ async function main(): Promise<void> {
     assert.equal(flaggedAccess.systemKeyCombos, true);
     const defaultType = parseComputerUseInput({ action: "type", text: "中文 input" });
     assert.equal(defaultType.viaClipboard, undefined);
+    const targetedType = parseComputerUseInput({ action: "type", text: "hello", coordinate: [10, 20] });
+    assert.equal(targetedType.x, 10);
+    assert.equal(targetedType.y, 20);
     const forcedClipboardType = parseComputerUseInput({ action: "type", text: "中文 input", viaClipboard: true });
     assert.equal(forcedClipboardType.viaClipboard, true);
     const openByName = parseComputerUseInput({ action: "open_app", app: "Safari" });
@@ -1549,7 +1604,9 @@ async function main(): Promise<void> {
       tccMissing.content,
       /macOS Accessibility and Screen Recording are now both granted|macOS Accessibility and Screen Recording permission\(s\) not yet granted/
     );
-    assert.match(tccMissing.content, /call request_access again/i);
+    if (/permission\(s\) not yet granted/i.test(tccMissing.content)) {
+      assert.match(tccMissing.content, /call request_access again/i);
+    }
 
     const tccTeachMissing = await executeRegisteredTool({
       cwd: project,
@@ -1581,9 +1638,11 @@ async function main(): Promise<void> {
     assert.equal(tccTeachMissing.isError, undefined);
     assert.match(
       tccTeachMissing.content,
-      /macOS Accessibility and Screen Recording are now both granted|macOS Screen Recording permission\(s\) not yet granted/
+      /macOS Accessibility and Screen Recording are now both granted|macOS Screen Recording permission\(s\) not yet granted|macOS Accessibility and Screen Recording permission\(s\) not yet granted/
     );
-    assert.match(tccTeachMissing.content, /call request_teach_access again/i);
+    if (/permission\(s\) not yet granted/i.test(tccTeachMissing.content)) {
+      assert.match(tccTeachMissing.content, /call request_teach_access again/i);
+    }
     await releaseComputerUseSession({ cwd: project, kiraWorkspaceRoot: workspace, sessionId: "tcc-teach-missing-session" });
 
     const teachStep = parseComputerUseInput({

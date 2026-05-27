@@ -2,7 +2,7 @@
  * Engine wrapper — bridges magi-next's runAgentQuery to Electron IPC.
  * Runs in the main process.
  */
-import { BrowserWindow } from "electron";
+import { BrowserWindow, systemPreferences } from "electron";
 import { runAgentQuery } from "../core/agent/query.ts";
 import { MagiContentPart, textMessage } from "../core/providers/ir.ts";
 import { loadConfig, McpServerConfig } from "../core/config.ts";
@@ -204,6 +204,7 @@ export class Engine {
             const action = computerUseInput.action;
             const isTeachAccess = action === "request_teach_access";
             const computerUsePreview = await this.computerUseApprovalPreview(computerUseInput);
+            const tccState = this.computerUseTccStateForApproval(action);
             request = {
               title: isTeachAccess ? "Allow Kira to guide you?" : "Allow Kira to control the computer?",
               message: isTeachAccess
@@ -214,12 +215,14 @@ export class Engine {
               reason: [
                 reason,
                 computerUseInput.reason !== undefined ? String(computerUseInput.reason).slice(0, 300) : undefined,
+                tccState ? formatComputerUseTccState(tccState) : undefined,
                 isTeachAccess
                   ? "Approve only if you want Kira to enter teaching mode for this task. Each step waits for your Next or Exit choice."
                   : "Coordinates are pixels from Kira's latest screenshot; Kira handles display scaling."
               ].filter((line): line is string => Boolean(line)).join("\n\n"),
               toolUse,
               kind: "computer-use",
+              tccState,
               computerUsePreview
             };
           } else if (toolUse.name === "Bash") {
@@ -423,6 +426,18 @@ export class Engine {
       return undefined;
     }
   }
+
+  private computerUseTccStateForApproval(action: unknown): { accessibility: boolean; screenRecording: boolean } | undefined {
+    if (process.platform !== "darwin") return undefined;
+    if (action !== "request_access" && action !== "request_teach_access") return undefined;
+    const accessibility = systemPreferences.isTrustedAccessibilityClient(false);
+    const screenRecording = systemPreferences.getMediaAccessStatus("screen") === "granted";
+    if (accessibility && screenRecording) return undefined;
+    return {
+      accessibility,
+      screenRecording
+    };
+  }
 }
 
 function parseStringArraySetting(value: string | undefined): string[] {
@@ -433,6 +448,19 @@ function parseStringArraySetting(value: string | undefined): string[] {
   } catch {
     return value.split(",").map((item) => item.trim()).filter(Boolean);
   }
+}
+
+function formatComputerUseTccState(state: { accessibility: boolean; screenRecording: boolean }): string {
+  const accessibility = state.accessibility
+    ? "Accessibility: *granted*"
+    : "Accessibility: *not granted*";
+  const screenRecording = state.screenRecording
+    ? "Screen Recording: *granted*"
+    : "Screen Recording: *not granted*";
+  return [
+    accessibility,
+    screenRecording
+  ].join("\n");
 }
 
 function normalizeComputerUseToolInput(toolName: string, input: Record<string, unknown>): Record<string, unknown> | undefined {

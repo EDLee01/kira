@@ -1,6 +1,6 @@
 import { ProviderConfig } from "../config.ts";
 import { MagiConfigError } from "../errors.ts";
-import { providerErrorFromResponse } from "./errors.ts";
+import { ProviderError, providerErrorFromResponse } from "./errors.ts";
 import { FetchLike, getApiKey, normalizeBaseUrl } from "./http.ts";
 import {
   MagiContentPart,
@@ -196,6 +196,7 @@ export class MessagesCompatibleAdapter implements ProviderAdapter {
     let text = "";
     let thinking = "";
     let usage: ProviderResponse["usage"];
+    let refusalReason: string | undefined;
     const toolCalls = new Map<number, { id?: string; name?: string; input: string }>();
     for await (const event of readSseEvents(response.body)) {
       // Skip empty data lines and keep-alive comments. The upstream may send
@@ -224,6 +225,7 @@ export class MessagesCompatibleAdapter implements ProviderAdapter {
       if (thinkingDelta) {
         thinking += thinkingDelta;
       }
+      refusalReason = refusalReason ?? readAnthropicRefusalReason(parsed);
       mergeAnthropicToolUseDeltas(toolCalls, parsed);
       const eventUsage = readAnthropicStreamUsage(parsed);
       if (eventUsage) {
@@ -231,6 +233,9 @@ export class MessagesCompatibleAdapter implements ProviderAdapter {
         yield { type: "usage", usage: eventUsage };
       }
       if (isRecord(parsed) && parsed.type === "message_stop") {
+        if (refusalReason) {
+          throw anthropicRefusalError(this.name, refusalReason);
+        }
         const finalText = finalizeAnthropicText(text, thinking, toolCalls.size);
         if (finalText !== text) {
           // Surface the fallback to the live stream too so the TUI shows it.
@@ -241,6 +246,9 @@ export class MessagesCompatibleAdapter implements ProviderAdapter {
       }
     }
 
+    if (refusalReason) {
+      throw anthropicRefusalError(this.name, refusalReason);
+    }
     const finalText = finalizeAnthropicText(text, thinking, toolCalls.size);
     if (finalText !== text) {
       yield { type: "text-delta", text: finalText.slice(text.length) };
@@ -342,6 +350,10 @@ function parseAnthropicMessagesResult(data: unknown): ProviderResponse {
   if (!isRecord(data)) {
     return { text: "", raw: data };
   }
+  const refusalReason = readAnthropicRefusalReason(data);
+  if (refusalReason) {
+    throw anthropicRefusalError("anthropic", refusalReason);
+  }
   const text = Array.isArray(data.content)
     ? data.content
       .map((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : ""))
@@ -363,6 +375,27 @@ function parseAnthropicMessagesResult(data: unknown): ProviderResponse {
     }
     : undefined;
   return { text: finalText, toolUses, usage, raw: data };
+}
+
+function anthropicRefusalError(providerName: string, reason: string): ProviderError {
+  return new ProviderError(`${providerName} returned a model refusal/content filter: ${reason}`, {
+    kind: "refusal",
+    retryable: false
+  });
+}
+
+function readAnthropicRefusalReason(data: unknown): string | undefined {
+  if (!isRecord(data)) {
+    return undefined;
+  }
+  const stopReason = readString(data.stop_reason);
+  if (stopReason === "refusal") {
+    return "stop_reason=refusal";
+  }
+  if (isRecord(data.delta) && readString(data.delta.stop_reason) === "refusal") {
+    return "stop_reason=refusal";
+  }
+  return undefined;
 }
 
 function toAnthropicMessage(message: MagiMessage): Record<string, unknown> {
@@ -475,7 +508,7 @@ function readAnthropicToolUses(content: unknown[]): MagiToolUsePart[] {
       type: "tool-use",
       id: typeof part.id === "string" ? part.id : part.name,
       name: part.name,
-      input: isRecord(part.input) ? part.input : {}
+      input: parseToolInput(part.input)
     }];
   });
 }
@@ -523,8 +556,9 @@ function mergeOpenAiToolCallDeltas(
       if (typeof rawToolCall.function.name === "string") {
         current.name = rawToolCall.function.name;
       }
-      if (typeof rawToolCall.function.arguments === "string") {
-        current.arguments += rawToolCall.function.arguments;
+      const argumentsDelta = stringifyToolArguments(rawToolCall.function.arguments);
+      if (argumentsDelta) {
+        current.arguments += argumentsDelta;
       }
     }
     toolCalls.set(index, current);
@@ -634,15 +668,30 @@ function parseToolInput(value: unknown): Record<string, unknown> {
   if (isRecord(value)) {
     return value;
   }
-  if (typeof value !== "string" || !value.trim()) {
+  if (value === undefined || value === null || value === "") {
     return {};
   }
+  if (typeof value !== "string") {
+    return { raw: value };
+  }
+  if (!value.trim()) return {};
   try {
     const parsed = JSON.parse(value) as unknown;
-    return isRecord(parsed) ? parsed : {};
+    return isRecord(parsed) ? parsed : { raw: parsed };
   } catch {
-    return {};
+    return { raw: value };
   }
+}
+
+function stringifyToolArguments(value: unknown): string {
+  if (value === undefined || value === null || value === "") {
+    return "";
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

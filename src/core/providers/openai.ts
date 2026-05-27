@@ -44,7 +44,7 @@ export class OpenAiAdapter implements ProviderAdapter {
     }
 
     const data = await response.json();
-    return endpoint === "responses" ? parseResponsesResult(data) : parseChatResult(data);
+    return endpoint === "responses" ? parseResponsesResult(data, this.name) : parseChatResult(data, this.name);
   }
 
   async *stream(request: ProviderRequest): AsyncGenerator<ProviderStreamEvent, ProviderResponse> {
@@ -70,14 +70,18 @@ export class OpenAiAdapter implements ProviderAdapter {
     }
     if (!isEventStreamResponse(response)) {
       const data = await response.json();
-      return endpoint === "responses" ? parseResponsesResult(data) : parseChatResult(data);
+      return endpoint === "responses" ? parseResponsesResult(data, this.name) : parseChatResult(data, this.name);
     }
 
     let text = "";
     let usage: ProviderResponse["usage"];
+    let refusalReason: string | undefined;
     const toolCalls = new Map<number, { id?: string; name?: string; arguments: string }>();
     for await (const event of readSseEvents(response.body)) {
       if (event.data === "[DONE]") {
+        if (refusalReason) {
+          throw openAiRefusalError(this.name, refusalReason);
+        }
         yield { type: "done" };
         return { text, toolUses: toolUsesFromOpenAiStream(toolCalls), usage };
       }
@@ -98,6 +102,7 @@ export class OpenAiAdapter implements ProviderAdapter {
         text += delta;
         yield { type: "text-delta", text: delta };
       }
+      refusalReason = refusalReason ?? readOpenAiRefusalReason(parsed);
       mergeOpenAiToolCallDeltas(toolCalls, parsed);
       const eventUsage = readUsage(parsed);
       if (eventUsage) {
@@ -106,6 +111,9 @@ export class OpenAiAdapter implements ProviderAdapter {
       }
     }
 
+    if (refusalReason) {
+      throw openAiRefusalError(this.name, refusalReason);
+    }
     yield { type: "done" };
     return { text, toolUses: toolUsesFromOpenAiStream(toolCalls), usage };
   }
@@ -252,11 +260,15 @@ function toChatMessage(message: MagiMessage): Record<string, unknown> {
   };
 }
 
-function parseChatResult(data: unknown): ProviderResponse {
+function parseChatResult(data: unknown, providerName = "openai"): ProviderResponse {
   if (!isRecord(data)) {
     throw new ProviderError("OpenAI chat response must be an object", { kind: "bad-request", retryable: false });
   }
   const choice = Array.isArray(data.choices) ? data.choices[0] : undefined;
+  const refusalReason = readOpenAiRefusalReason(choice) ?? readOpenAiRefusalReason(data);
+  if (refusalReason) {
+    throw openAiRefusalError(providerName, refusalReason);
+  }
   const text = isRecord(choice) && isRecord(choice.message) ? readMessageText(choice.message) : "";
   const toolUses = isRecord(choice) && isRecord(choice.message) ? readOpenAiToolUses(choice.message.tool_calls) : [];
   return {
@@ -308,9 +320,13 @@ function readContentText(content: unknown): string {
   }).join("");
 }
 
-function parseResponsesResult(data: unknown): ProviderResponse {
+function parseResponsesResult(data: unknown, providerName = "openai"): ProviderResponse {
   if (!isRecord(data)) {
     throw new ProviderError("OpenAI responses result must be an object", { kind: "bad-request", retryable: false });
+  }
+  const refusalReason = readOpenAiRefusalReason(data);
+  if (refusalReason) {
+    throw openAiRefusalError(providerName, refusalReason);
   }
   const text = typeof data.output_text === "string" ? data.output_text : readResponsesOutputText(data);
   return {
@@ -329,6 +345,71 @@ function readResponsesOutputText(data: Record<string, unknown>): string {
     .flatMap((item) => (isRecord(item) && Array.isArray(item.content) ? item.content : []))
     .map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
     .join("");
+}
+
+function openAiRefusalError(providerName: string, reason: string): ProviderError {
+  return new ProviderError(`${providerName} returned a model refusal/content filter: ${reason}`, {
+    kind: "refusal",
+    retryable: false
+  });
+}
+
+function readOpenAiRefusalReason(data: unknown): string | undefined {
+  if (!isRecord(data)) {
+    return undefined;
+  }
+
+  const finishReason = readString(data.finish_reason);
+  if (isRefusalFinishReason(finishReason)) {
+    return `finish_reason=${finishReason}`;
+  }
+
+  const eventType = readString(data.type);
+  if (eventType?.includes("refusal")) {
+    return readString(data.delta) ?? readString(data.refusal) ?? eventType;
+  }
+
+  const status = readString(data.status);
+  const incompleteReason = isRecord(data.incomplete_details) ? readString(data.incomplete_details.reason) : undefined;
+  if (status === "incomplete" && isRefusalFinishReason(incompleteReason)) {
+    return `incomplete_reason=${incompleteReason}`;
+  }
+
+  const refusal = readString(data.refusal);
+  if (refusal) {
+    return refusal;
+  }
+
+  if (Array.isArray(data.choices)) {
+    for (const choice of data.choices) {
+      const reason = readOpenAiRefusalReason(choice);
+      if (reason) return reason;
+    }
+  }
+
+  for (const key of ["message", "delta"]) {
+    const reason = readOpenAiRefusalReason(data[key]);
+    if (reason) return reason;
+  }
+
+  for (const key of ["content", "output"]) {
+    const value = data[key];
+    if (!Array.isArray(value)) continue;
+    for (const part of value) {
+      if (!isRecord(part)) continue;
+      if (part.type === "refusal") {
+        return readString(part.refusal) ?? readString(part.text) ?? "refusal content block";
+      }
+      const reason = readOpenAiRefusalReason(part);
+      if (reason) return reason;
+    }
+  }
+
+  return undefined;
+}
+
+function isRefusalFinishReason(value: string | undefined): boolean {
+  return value === "content_filter" || value === "safety" || value === "refusal";
 }
 
 function readOpenAiToolUses(value: unknown): MagiToolUsePart[] {
@@ -389,8 +470,9 @@ function mergeOpenAiToolCallDeltas(
       if (typeof rawToolCall.function.name === "string") {
         current.name = rawToolCall.function.name;
       }
-      if (typeof rawToolCall.function.arguments === "string") {
-        current.arguments += rawToolCall.function.arguments;
+      const argumentsDelta = stringifyToolArguments(rawToolCall.function.arguments);
+      if (argumentsDelta) {
+        current.arguments += argumentsDelta;
       }
     }
     toolCalls.set(index, current);
@@ -417,15 +499,26 @@ function parseToolInput(value: unknown): Record<string, unknown> {
   if (isRecord(value)) {
     return value;
   }
-  if (typeof value !== "string" || !value.trim()) {
+  if (value === undefined || value === null || value === "") {
     return {};
   }
+  if (typeof value !== "string") {
+    return { raw: value };
+  }
+  if (!value.trim()) return {};
   try {
     const parsed = JSON.parse(value) as unknown;
-    return isRecord(parsed) ? parsed : {};
+    return isRecord(parsed) ? parsed : { raw: parsed };
   } catch {
-    return {};
+    return { raw: value };
   }
+}
+
+function stringifyToolArguments(value: unknown): string {
+  if (value === undefined || value === null || value === "") {
+    return "";
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
 }
 
 function readStreamText(data: unknown): string | undefined {
@@ -465,6 +558,10 @@ function readUsage(data: unknown): { inputTokens: number; outputTokens: number }
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

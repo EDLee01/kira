@@ -5,6 +5,7 @@ export type ProviderFailureKind =
   | "model-unavailable"
   | "auth"
   | "bad-request"
+  | "refusal"
   | "network"
   | "unknown";
 
@@ -72,6 +73,8 @@ function formatProviderErrorMessage(providerName: string, status: number, kind: 
       return `${base} (model not found). The model name may be wrong or unavailable. Run '/model' to see configured aliases, or check provider docs for current model names.`;
     case "bad-request":
       return `${base} (bad request). The request shape was rejected — likely a config issue or unsupported parameter for this model.`;
+    case "refusal":
+      return `${base} (model refusal or content filter). The provider rejected the request before tool execution.`;
     case "network":
       return `${base} (network error). Check your internet connection and the provider's baseUrl.`;
     default:

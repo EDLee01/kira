@@ -7,6 +7,7 @@ import { ensureMagiHome, getMagiPaths } from "../core/paths.ts";
 import { buildDesktopProvider } from "./desktop-provider";
 import { readDesktopSettings, readKiraWorkspaceRoot } from "./settings-store";
 import { buildKiraWorkspaceInfo, defaultProjectDir } from "../core/kira-workspace.ts";
+import { callComputerUseHelper } from "../core/tools/computer-use-runtime.ts";
 
 let mainWindow: BrowserWindow | null = null;
 let stopScheduler: (() => void) | null = null;
@@ -69,9 +70,94 @@ function createWindow(): void {
   });
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  if (process.env.KIRA_COMPUTER_USE_SMOKE === "1") {
+    await runComputerUseSmoke();
+    app.quit();
+    return;
+  }
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   stopScheduler?.();
   app.quit();
 });
+
+async function runComputerUseSmoke(): Promise<void> {
+  const cwd = process.cwd();
+  const context = { cwd, env: process.env };
+  let cursor: { x: number; y: number } | undefined;
+
+  await reportSmokeStep("permissions", async () => {
+    return callComputerUseHelper({
+      command: "check_permissions",
+      payload: {},
+      ...context
+    });
+  });
+
+  await reportSmokeStep("list_displays", async () => {
+    const displays = await callComputerUseHelper<Array<{ displayId?: number; width: number; height: number; scaleFactor?: number }>>({
+      command: "list_displays",
+      payload: {},
+      ...context
+    });
+    return {
+      count: displays.length,
+      displays: displays.map((display) => ({
+        displayId: display.displayId,
+        width: display.width,
+        height: display.height,
+        scaleFactor: display.scaleFactor
+      }))
+    };
+  });
+
+  await reportSmokeStep("screenshot", async () => {
+    const result = await callComputerUseHelper<{ base64: string; width: number; height: number; displayId?: number; backend?: string }>({
+      command: "screenshot",
+      payload: { targetWidth: 320, targetHeight: 200, jpegQuality: 0.5 },
+      ...context
+    });
+    return {
+      width: result.width,
+      height: result.height,
+      displayId: result.displayId,
+      backend: result.backend,
+      imageBytes: Buffer.byteLength(result.base64, "base64")
+    };
+  });
+
+  await reportSmokeStep("cursor_position", async () => {
+    cursor = await callComputerUseHelper<{ x: number; y: number }>({
+      command: "cursor_position",
+      payload: {},
+      ...context
+    });
+    return cursor;
+  });
+
+  if (cursor) {
+    await reportSmokeStep("native_input_gate", async () => {
+      return callComputerUseHelper({
+        command: "move_mouse",
+        payload: cursor,
+        ...context
+      });
+    });
+  }
+}
+
+async function reportSmokeStep(name: string, run: () => Promise<unknown>): Promise<void> {
+  try {
+    const result = await run();
+    console.log(JSON.stringify({ step: name, ok: true, result }));
+  } catch (error) {
+    console.log(JSON.stringify({
+      step: name,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+}

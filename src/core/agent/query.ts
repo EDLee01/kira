@@ -120,6 +120,7 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
   let routeIndex = 0;
   let activeRoute = routes[routeIndex];
   let finalText = "";
+  let genericRefusalRetryUsed = false;
   const mcpTools = input.mcp ? new McpToolRegistry({ servers: input.mcp.servers, env: input.env, tokenLookup: input.mcp.tokenLookup, tokenRefresh: input.mcp.tokenRefresh }) : undefined;
   const currentUserIntent = latestUserText(input.messages);
   const disabledBuiltinTools = new Set(["Browser", ...(input.disabledBuiltinTools ?? [])]);
@@ -232,16 +233,8 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
         yield { type: "usage", usage: response.usage };
       }
 
-      if (response.text && !streamedTextThisTurn) {
-        finalText += response.text;
-        yield { type: "text_delta", text: response.text };
-      }
-
       throwIfCancelled(input.signal);
       const toolUses = normalizeToolUses(response.toolUses);
-      for (const toolUse of toolUses) {
-        yield { type: "tool_use", toolUse };
-      }
       const assistantMessage: MagiMessage = {
         role: "assistant",
         content: [
@@ -249,6 +242,33 @@ async function* runAgentQueryInner(input: AgentQueryInput): AsyncGenerator<Agent
           ...toolUses
         ]
       };
+      if (
+        toolUses.length === 0
+        && !streamedTextThisTurn
+        && !genericRefusalRetryUsed
+        && shouldRetryGenericRefusal({ text: response.text, userIntent: currentUserIntent })
+      ) {
+        genericRefusalRetryUsed = true;
+        messages.push(
+          assistantMessage,
+          textMessage("system", buildGenericRefusalRetryInstruction(currentUserIntent))
+        );
+        yield {
+          type: "error",
+          error: "Kira produced a generic refusal without using available tools; retrying once with task-execution guidance.",
+          retryable: true
+        };
+        continue;
+      }
+
+      if (response.text && !streamedTextThisTurn) {
+        finalText += response.text;
+        yield { type: "text_delta", text: response.text };
+      }
+
+      for (const toolUse of toolUses) {
+        yield { type: "tool_use", toolUse };
+      }
       messages.push(assistantMessage);
       yield { type: "assistant_message", message: assistantMessage };
 
@@ -626,6 +646,37 @@ function latestUserText(messages: MagiMessage[]): string {
     }
   }
   return "";
+}
+
+function shouldRetryGenericRefusal(input: { text: string; userIntent: string }): boolean {
+  const text = input.text.trim();
+  const userIntent = input.userIntent.trim();
+  if (!text || !userIntent) {
+    return false;
+  }
+  if (!looksActionable(userIntent)) {
+    return false;
+  }
+  return looksLikeGenericRefusal(text);
+}
+
+function looksActionable(text: string): boolean {
+  return /(?:帮我|给我|做|制作|创建|生成|写|改|修改|编辑|检查|完成|整理|总结|保存|打开|输入|发送|报告|文档|文件|作业|课件|PPT|PowerPoint|Word|Excel|PDF|代码|create|make|build|write|edit|generate|complete|finish|check|fix|file|report|document|homework|assignment|slide|deck|ppt|powerpoint)/i.test(text);
+}
+
+function looksLikeGenericRefusal(text: string): boolean {
+  return /自己的作业自己做|作业.*自己做|抱歉[^。.!?\n]{0,40}(?:不能|无法|不可以)|(?:我|Kira)[^。.!?\n]{0,30}(?:不能|无法|不可以)[^。.!?\n]{0,60}(?:帮助|完成|代做|执行|创建|生成|写)|(?:can't|cannot|won't|unable to|not able to)[^.!?\n]{0,80}(?:help|do|complete|write|create|make|assist)|do your own homework/i.test(text);
+}
+
+function buildGenericRefusalRetryInstruction(userIntent: string): string {
+  return [
+    "[Harness retry: generic refusal detected]",
+    "The previous assistant response refused without using available tools. Re-evaluate the user's request as a concrete task.",
+    "If the request is allowed and can be completed with file tools, shell/script tools, or authorized ComputerUse, do the work instead of moralizing or giving a generic capability refusal.",
+    "For writing, educational, coursework, reports, slide decks, Office files, and local artifact tasks, provide explanations, outlines, drafts, examples, checks, or create the requested file when appropriate.",
+    "Refuse only the specific part that is actually disallowed, such as explicit cheating, impersonation, covert submission as the user's original work, credential theft, malware, or destructive abuse. State that exact blocker briefly and offer a useful allowed alternative.",
+    `User request: ${userIntent.slice(0, 1000)}`
+  ].join("\n");
 }
 
 function normalizeToolUses(toolUses: MagiToolUsePart[] | undefined): MagiToolUsePart[] {
