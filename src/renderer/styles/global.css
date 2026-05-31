@@ -176,7 +176,8 @@ button {
 .btn-send,
 .btn-stop,
 .settings-close,
-.suggestion {
+.suggestion,
+.trust-pill {
   border: none;
   border-radius: var(--radius);
   background: transparent;
@@ -412,6 +413,85 @@ button {
 .toolbar-button:disabled {
   cursor: not-allowed;
   opacity: 0.42;
+}
+
+.trust-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 10px 22px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+}
+
+.trust-bar.needs-setup {
+  background: color-mix(in srgb, var(--warn) 7%, var(--surface));
+}
+
+.trust-bar-main {
+  display: grid;
+  gap: 1px;
+  min-width: 108px;
+}
+
+.trust-bar-main .section-kicker {
+  padding: 0;
+}
+
+.trust-bar-main strong {
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.trust-bar-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.trust-pill {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--fg-3);
+  text-align: left;
+}
+
+.trust-pill:hover {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+  color: var(--fg);
+}
+
+.trust-pill > span:nth-child(2) {
+  color: var(--fg-2);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.trust-pill b {
+  overflow: hidden;
+  color: var(--fg-4);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trust-pill.ok b {
+  color: var(--fg-3);
 }
 
 .status-dot {
@@ -1864,8 +1944,14 @@ button {
   }
 
   .workspace-grid,
-  .setup-strip {
+  .setup-strip,
+  .trust-bar,
+  .trust-bar-grid {
     grid-template-columns: 1fr;
+  }
+
+  .trust-bar {
+    align-items: stretch;
   }
 
   .settings-layout {
@@ -1896,6 +1982,10 @@ button {
 
   .appbar {
     padding: 0 12px;
+  }
+
+  .trust-bar {
+    padding: 10px 12px;
   }
 
   .appbar-actions span {

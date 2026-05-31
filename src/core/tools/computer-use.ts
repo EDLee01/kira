@@ -2588,6 +2588,7 @@ function asComputerUseError(error: unknown, action: ComputerUseAction): ToolErro
   const isScreenshot = action === "screenshot";
   return new ToolError([
     isScreenshot ? "Kira cannot observe the screen right now." : "Kira cannot control the computer right now.",
+    "Check Screen Recording permission and Accessibility in Mac Permissions settings.",
     "If this is the first time using Computer Use, complete Mac Permissions in Settings once, restart Kira, then retry. If permissions were already granted, do not ask again; report the system detail below and suggest restarting Kira or removing/re-adding Kira in macOS privacy settings.",
     "",
     `System detail: ${message}`

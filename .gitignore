@@ -5,6 +5,7 @@ native/*/build/
 .DS_Store
 *.log
 .magi-browser-profile/
+.kira-reports/
 
 # Local state and secrets
 .env

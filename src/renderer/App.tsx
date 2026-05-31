@@ -673,7 +673,7 @@ export default function App() {
           </div>
           <div className="appbar-actions">
             {running ? (
-              <button className="toolbar-button danger" onClick={cancelCurrentQuery}>
+              <button className="toolbar-button danger" onClick={cancelCurrentQuery} title="Stops the current request">
                 <Icon name="stop" />
                 <span>Stop</span>
               </button>
@@ -689,6 +689,14 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        <TrustStatusBar
+          settings={settings}
+          trustStatus={trustStatus}
+          workspace={workspace}
+          onOpenSettings={openSettings}
+          onRefresh={loadTrustStatus}
+        />
 
         {activeTab === "chat" && (
           <section className="chat-shell">
@@ -752,7 +760,7 @@ export default function App() {
                     </button>
                   </div>
                   {running ? (
-                    <button className="btn-stop" onClick={cancelCurrentQuery} title="Stop">
+                    <button className="btn-stop" onClick={cancelCurrentQuery} title="Stops the current request (Esc)">
                       <Icon name="stop" />
                     </button>
                   ) : (
@@ -799,6 +807,67 @@ export default function App() {
         />
       )}
     </div>
+  );
+}
+
+function TrustStatusBar({ settings, trustStatus, workspace, onOpenSettings, onRefresh }: {
+  settings: SettingsState;
+  trustStatus: TrustStatus | null;
+  workspace: WorkspaceInfo | null;
+  onOpenSettings: (section: SettingsSection) => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const modelReady = trustStatus?.model.configured ?? Boolean(settings.apiKey && settings.model);
+  const screenReady = permissionOk(trustStatus?.permissions.screen);
+  const accessibilityReady = permissionOk(trustStatus?.permissions.accessibility);
+  const workspaceReady = Boolean(workspace?.projectDir);
+  const macPermissionsRequired = !trustStatus || trustStatus.platform === "darwin";
+  const macPermissionsReady = !macPermissionsRequired || (screenReady === true && accessibilityReady === true);
+  const needsSetup = !modelReady || !workspaceReady || !macPermissionsReady;
+
+  return (
+    <section className={`trust-bar ${needsSetup ? "needs-setup" : ""}`}>
+      <div className="trust-bar-main">
+        <span className="section-kicker">Quick Setup</span>
+        <strong>{needsSetup ? "Set up Kira" : "Kira is ready"}</strong>
+      </div>
+      <div className="trust-bar-grid">
+        <TrustPill
+          label="Model"
+          value={modelReady ? providerText(settings, trustStatus) : "Not configured"}
+          ok={modelReady}
+          onClick={() => onOpenSettings("model")}
+        />
+        <TrustPill
+          label="Workspace"
+          value={workspaceReady ? displayPathName(workspace?.projectDir) : "Not set"}
+          ok={workspaceReady}
+          onClick={() => onOpenSettings("workspace")}
+        />
+        <TrustPill
+          label="Mac Permissions"
+          value={`Screen Recording: ${permissionLabel(trustStatus?.permissions.screen)} / Accessibility: ${permissionLabel(trustStatus?.permissions.accessibility)}`}
+          ok={macPermissionsReady}
+          onClick={() => onOpenSettings("computer-use")}
+        />
+      </div>
+      <button className="settings-mini-btn" onClick={() => void onRefresh()}>Refresh</button>
+    </section>
+  );
+}
+
+function TrustPill({ label, value, ok, onClick }: {
+  label: string;
+  value: string;
+  ok: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`trust-pill ${ok ? "ok" : "warn"}`} onClick={onClick}>
+      <span className={`permission-dot ${ok ? "ok" : "warn"}`} />
+      <span>{label}</span>
+      <b>{value}</b>
+    </button>
   );
 }
 
